@@ -43,7 +43,10 @@ internal fun readStoredLanguageSync(context: Context): AppLanguage = runCatching
  * 引用同类的 companion 成员在部分编译器版本上会报初始化顺序问题，
  * 顶层常量没有这个歧义。
  */
-const val DEFAULT_DAV_PATH = "myDeepSeek/backup.json"
+const val DEFAULT_DAV_PATH = "myDeepSeek/sync.jsonl"
+
+/** 上一版的默认路径（大 JSON）。读设置时顺手换掉，免得上线后两个名字并存。 */
+private const val LegacyDavPath = "myDeepSeek/backup.json"
 
 /** 持久化的全局配置。 */
 data class StoredSettings(
@@ -184,7 +187,8 @@ class SettingsStore(private val context: Context) {
             davUrl = prefs[Keys.DAV_URL] ?: StoredSettings().davUrl,
             davUser = prefs[Keys.DAV_USER] ?: StoredSettings().davUser,
             davPassword = readDavPassword(prefs),
-            davPath = prefs[Keys.DAV_PATH] ?: StoredSettings().davPath,
+            davPath = (prefs[Keys.DAV_PATH] ?: StoredSettings().davPath)
+                .let { if (it == LegacyDavPath) DEFAULT_DAV_PATH else it },
             davAutoSync = prefs[Keys.DAV_AUTO_SYNC] ?: StoredSettings().davAutoSync,
             davLastSyncAt = prefs[Keys.DAV_LAST_SYNC] ?: StoredSettings().davLastSyncAt,
         )

@@ -1,18 +1,15 @@
 package com.simplechat.app.data.sync
 
+import android.content.Context
 import com.simplechat.app.R
-import com.simplechat.app.data.AppTextException
-import com.simplechat.app.data.Attachments
+import com.simplechat.app.data.AttachmentFiles
 import com.simplechat.app.data.BackupConversation
-import com.simplechat.app.data.BackupFile
-import com.simplechat.app.data.BackupPreset
 import com.simplechat.app.data.ChatRepository
-import com.simplechat.app.data.ImportMode
 import com.simplechat.app.data.Res
 import com.simplechat.app.data.SettingsStore
 import com.simplechat.app.data.StoredSettings
-import com.simplechat.app.data.backupJson
 import com.simplechat.app.data.userMessage
+import java.io.File
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -49,12 +46,24 @@ data class SyncState(
 )
 
 /**
- * WebDAV 同步。
+ * WebDAV 同步（**流式**）。
  *
- * ### 同步的是"整份备份"，不是增量
+ * ### 数据怎么走
  *
- * 本地与远端的往返都用 `BackupFile`（与「导出所有数据」同一份格式），
- * 于是同步、备份、导入三条链路共用一套模型 —— 加字段只改一处。
+ * ```
+ * 远端 sync.jsonl ──流式下载──> 临时文件 ──逐行解析──> 逐条比对/落库
+ *                                                        │
+ * 本地数据库 ──逐条取会话──> 临时文件 ──流式上传──> 远端 sync.jsonl
+ *                                   └──图片单独上传──> 远端 media/<sha256>.jpg
+ * ```
+ *
+ * 全程**没有任何一步把整个库读进内存**：
+ *
+ * - 载荷是 JSONL（一行一个会话），读写都是逐行的（见 [SyncPayload]）；
+ * - 图片不进 JSON，按内容哈希单独上传，JSON 里只留文件名；
+ * - 上传直接给 OkHttp 一个 `File`，它自己边读边发。
+ *
+ * 峰值内存 ≈ **最大的一个会话** + 一张图片的字节，与库有多大无关。
  *
  * ### 冲突策略：**按会话 last-write-wins**
  *
@@ -67,6 +76,7 @@ data class SyncState(
  * 那会给 messages 加一套"已删除但保留"的状态，对个人使用不划算。
  */
 class SyncManager(
+    private val context: Context,
     private val repository: ChatRepository,
     private val settings: SettingsStore,
     private val client: WebDavClient = WebDavClient(),
@@ -118,35 +128,36 @@ class SyncManager(
 
     private suspend fun sync() {
         if (!running.tryLock()) return
+        val work = File(context.cacheDir, SyncWorkDir).apply { mkdirs() }
+        val remote = File(work, "remote.jsonl")
+        val incoming = File(work, "incoming.jsonl")
+        val payload = File(work, "payload.jsonl")
+
         try {
             val stored = settings.current()
             if (!stored.syncConfigured) {
-                _state.value = SyncState(
-                    message = Res.get(R.string.sync_need_config),
-                    failed = true,
-                )
+                _state.value = SyncState(message = Res.get(R.string.sync_need_config), failed = true)
                 return
             }
             val config = stored.davConfig()
 
             _state.value = SyncState(running = true, stage = SyncStage.DOWNLOAD)
-            val remote = client.download(config)?.let { parse(it) }
+            val hadRemote = client.downloadToFile(config, config.path, remote)
 
             _state.value = SyncState(running = true, stage = SyncStage.MERGE)
-            val pulled = merge(remote)
+            val merge = merge(config, remote, incoming, hadRemote)
 
             _state.value = SyncState(running = true, stage = SyncStage.UPLOAD)
-            val payload = repository.exportBackup().toByteArray()
-            client.upload(config, payload)
+            // 先把本地状态写成载荷文件（逐会话），再上传 —— 内存里只过一条会话
+            val mediaNames = writeLocalPayload(payload)
+            // 图片先走：否则另一端可能读到"引用了还不存在的图片"的载荷
+            val mediaUploaded = uploadMedia(config, mediaNames)
+            client.uploadFile(config, config.path, payload, WebDavClient.SyncPayloadMedia)
 
             settings.setDavLastSyncAt(System.currentTimeMillis())
             _state.value = SyncState(
-                message = Res.get(
-                    R.string.sync_done,
-                    Attachments.formatSize(payload.size),
-                    pulled,
-                ),
-                pulled = pulled,
+                message = buildResultMessage(merge, mediaUploaded),
+                pulled = merge.pulled,
             )
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -154,11 +165,27 @@ class SyncManager(
             _state.value = SyncState(message = error.userMessage(), failed = true)
         } finally {
             running.unlock()
+            listOf(remote, incoming, payload).forEach { runCatching { it.delete() } }
         }
     }
 
+    private fun buildResultMessage(merge: MergeOutcome, mediaUploaded: Int): String = buildString {
+        append(Res.get(R.string.sync_done, merge.pulled, mediaUploaded))
+        if (merge.brokenLines > 0) append(Res.get(R.string.sync_note_broken, merge.brokenLines))
+        if (merge.legacyRemoteReplaced) append(Res.get(R.string.sync_note_legacy))
+    }
+
+    // ── 合并（逐行） ─────────────────────────────────────
+
+    private data class MergeOutcome(
+        val pulled: Int = 0,
+        val brokenLines: Int = 0,
+        /** 云端原来放的是旧格式/别的文件，这次被新格式整体替换了。 */
+        val legacyRemoteReplaced: Boolean = false,
+    )
+
     /**
-     * 把远端合并进本地，返回**拉取（新增或覆盖）的会话数**。
+     * 把远端合并进本地。
      *
      * 顺序很关键：先删掉本地那份过期的会话，再按 `MERGE` 导入 ——
      * `MERGE` 遇到已存在的 id 会**整条跳过**（它服务的是"多设备汇总"，
@@ -168,89 +195,146 @@ class SyncManager(
      * 跟着已删会话留着），但这里删是为了**换版本**，不是用户主动删 ——
      * 把草稿先存下来、导入完再放回去。
      */
-    private suspend fun merge(remote: BackupFile?): Int {
-        if (remote == null) return 0
+    private suspend fun merge(
+        config: WebDavClient.Config,
+        remote: File,
+        incoming: File,
+        hadRemote: Boolean,
+    ): MergeOutcome {
+        val header = SyncPayload.readHeader(remote)
+            ?: return MergeOutcome(
+                brokenLines = 0,
+                legacyRemoteReplaced = hadRemote && remote.length() > 0L,
+            )
 
-        val local = backupJson.decodeFromString<BackupFile>(repository.exportBackup())
-        val plan = planMerge(local, remote)
-        if (plan.isEmpty) return 0
+        val localStamps = repository.syncStamps().associate { it.id to it.updatedAt }
+        val overwriting = mutableListOf<String>()
+        var pulled = 0
+        var broken = 0
 
-        if (plan.overwritingIds.isNotEmpty()) {
-            val drafts = plan.overwritingIds.mapNotNull { id ->
-                repository.findDraft(id)?.let { id to it }
+        // 逐行读远端 → 需要的写进 incoming，另存一份"要覆盖谁"的名单
+        SyncPayloadWriter(incoming.bufferedWriter()).use { writer ->
+            for ((_, conversation) in SyncPayload.conversationsWithFailures(remote)) {
+                if (conversation == null) {
+                    broken++
+                    continue
+                }
+                val mine = localStamps[conversation.id]
+                if (!shouldPull(conversation.updatedAt, mine)) continue
+                if (mine != null) overwriting += conversation.id
+                writer.writeConversation(adoptMedia(config, conversation))
+                pulled++
             }
-            repository.deleteConversations(plan.overwritingIds)
-            drafts.forEach { (id, text) -> repository.saveDraft(id, text) }
         }
 
-        repository.importParsed(
-            BackupFile(
-                exportedAt = System.currentTimeMillis(),
-                conversations = plan.conversations,
-                presets = plan.presets,
-            ),
-            ImportMode.MERGE,
+        if (pulled == 0) return MergeOutcome(brokenLines = broken)
+
+        val drafts = overwriting.mapNotNull { id -> repository.findDraft(id)?.let { id to it } }
+        if (overwriting.isNotEmpty()) repository.deleteConversations(overwriting)
+        drafts.forEach { (id, text) -> repository.saveDraft(id, text) }
+
+        repository.importSyncStream(
+            conversations = SyncPayload.conversations(incoming),
+            presetsToWrite = newerPresets(repository.syncPresets(), header.presets),
         )
-        return plan.conversations.size
+        return MergeOutcome(pulled = pulled, brokenLines = broken)
     }
 
-    /** 远端那份文件必须是本应用的备份 —— 别的 JSON 直接拒绝，别把它当空备份覆盖掉。 */
-    private fun parse(bytes: ByteArray): BackupFile {
-        val file = runCatching {
-            backupJson.decodeFromString<BackupFile>(bytes.decodeToString())
-        }.getOrNull() ?: throw AppTextException(R.string.sync_err_not_backup)
-        if (file.format != BackupFile.FORMAT) throw AppTextException(R.string.sync_err_not_backup)
-        return file
-    }
-}
-
-/**
- * 一次同步要写进本地的内容（纯函数算出来，落库交给调用方）。
- *
- * 抽成纯函数只有一个理由：**这是整个同步里唯一会丢数据的地方** ——
- * 覆盖错了就是把用户几天的稿子删掉。它必须能脱离数据库被单测钉死。
- */
-internal data class MergePlan(
-    /** 远端更新（或本地没有）的会话，按原顺序。 */
-    val conversations: List<BackupConversation> = emptyList(),
-    /** 远端更新的预设。 */
-    val presets: List<BackupPreset> = emptyList(),
-    /** 需要先删掉本地旧版本再导入的会话 id。 */
-    val overwritingIds: List<String> = emptyList(),
-) {
-    val isEmpty: Boolean get() = conversations.isEmpty() && presets.isEmpty()
-}
-
-/**
- * 冲突判定：**按条 last-write-wins**，时间相同时保留本地。
- *
- * “相同时间保留本地”不是随手写的：两台设备在同一毫秒各写一次时，
- * 任何一侧被覆盖都意味着另一侧的编辑**凭空消失**，而"不动"至少保证
- * 用户手上这台看到的东西是连续的。
- *
- * 只比较 `updatedAt`，不看消息条数：一条被删掉一半的对话也可能时间更新，
- * 那是用户自己删的，应当以时间新的一方为准。
- */
-internal fun planMerge(local: BackupFile, remote: BackupFile): MergePlan {
-    val localConversations = local.conversations.associateBy { it.id }
-    val localPresets = local.presets.associateBy { it.id }
-
-    val conversations = remote.conversations.filter { candidate ->
-        val mine = localConversations[candidate.id]
-        mine == null || candidate.updatedAt > mine.updatedAt
-    }
-    val presets = remote.presets.filter { candidate ->
-        val mine = localPresets[candidate.id]
-        mine == null || candidate.updatedAt > mine.updatedAt
-    }
-
-    return MergePlan(
-        conversations = conversations,
-        presets = presets,
-        overwritingIds = conversations.mapNotNull { candidate ->
-            candidate.id.takeIf { localConversations.containsKey(it) }
+    /**
+     * 让远端会话里的图片**在本地可用**，并把附件改写成"本地文件名"。
+     *
+     * 远端载荷里的图片只有文件名（内容哈希）。本地没有这个文件时拉一次 ——
+     * 文件名就是内容哈希，所以"有"就等于"对"，不需要再校验。
+     */
+    private suspend fun adoptMedia(
+        config: WebDavClient.Config,
+        conversation: BackupConversation,
+    ): BackupConversation = conversation.copy(
+        messages = conversation.messages.map { message ->
+            if (message.attachments.none { it.isImage }) return@map message
+            message.copy(
+                attachments = message.attachments.map { attachment ->
+                    if (!attachment.isImage) return@map attachment
+                    // 老数据可能还把图片内联在 data 里：先落到本地，再统一成文件名
+                    val name = attachment.path?.takeIf { it.isNotBlank() }
+                        ?: AttachmentFiles.contentAddressed(context, attachment)
+                        ?: return@map attachment.copy(data = "", path = null)
+                    ensureMediaFile(config, name)
+                    attachment.copy(data = "", path = name)
+                },
+            )
         },
     )
+
+    /** 本地没有就拉一次；拉不到（远端也缺）就留着空引用，界面显示"原件缺失"。 */
+    private suspend fun ensureMediaFile(config: WebDavClient.Config, name: String) {
+        val target = AttachmentFiles.fileOf(context, name) ?: return
+        if (target.isFile && target.length() > 0L) return
+        runCatching { client.downloadToFile(config, mediaRemotePath(name), target) }
+    }
+
+    // ── 导出（逐会话写文件） ──────────────────────────────
+
+    /**
+     * 把本地状态写成载荷文件，返回**图片文件名**清单（供随后上传）。
+     *
+     * 一次只取一个会话：`syncStamps()` 给出 id + 时间戳，再逐个
+     * `backupConversationForSync(id)` —— 全程不会同时持有两条会话。
+     */
+    private suspend fun writeLocalPayload(target: File): List<String> {
+        val media = linkedSetOf<String>()
+        SyncPayloadWriter(target.bufferedWriter()).use { writer ->
+            writer.writeHeader(
+                SyncHeader(exportedAt = System.currentTimeMillis(), presets = repository.syncPresets()),
+            )
+            for (stamp in repository.syncStamps()) {
+                val conversation = repository.backupConversationForSync(stamp.id) ?: continue
+                writer.writeConversation(externalizeMedia(conversation, media))
+            }
+        }
+        return media.toList()
+    }
+
+    /** 图片 → 内容寻址的文件名；文本附件保持内联（它们本来就小）。 */
+    private fun externalizeMedia(
+        conversation: BackupConversation,
+        collected: MutableSet<String>,
+    ): BackupConversation = conversation.copy(
+        messages = conversation.messages.map { message ->
+            if (message.attachments.none { it.isImage }) return@map message
+            message.copy(
+                attachments = message.attachments.map { attachment ->
+                    if (!attachment.isImage) return@map attachment
+                    val name = AttachmentFiles.contentAddressed(context, attachment)
+                    if (name == null) {
+                        // 原件缺失（用户清过数据 / 老数据坏了）：不把坏引用传上去
+                        attachment.copy(data = "", path = null)
+                    } else {
+                        collected += name
+                        attachment.copy(data = "", path = name)
+                    }
+                },
+            )
+        },
+    )
+
+    /** 上传远端还没有的图片。返回本次实际传上去的张数。 */
+    private suspend fun uploadMedia(config: WebDavClient.Config, names: List<String>): Int {
+        if (names.isEmpty()) return 0
+        var uploaded = 0
+        for (name in names) {
+            val file = AttachmentFiles.fileOf(context, name) ?: continue
+            if (!file.isFile || file.length() == 0L) continue
+            if (runCatching { client.exists(config, mediaRemotePath(name)) }.getOrDefault(false)) continue
+            client.uploadFile(config, mediaRemotePath(name), file)
+            uploaded++
+        }
+        return uploaded
+    }
+
+    private companion object {
+        const val SyncWorkDir = "sync"
+    }
 }
 
 /** 设置 → 连接参数。集中在一处，避免每个调用点各拼一次。 */

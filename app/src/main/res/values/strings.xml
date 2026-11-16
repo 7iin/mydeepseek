@@ -535,7 +535,7 @@
     <string name="sync_stage_download">正在下载云端备份…</string>
     <string name="sync_stage_merge">正在合并…</string>
     <string name="sync_stage_upload">正在上传…</string>
-    <string name="sync_done">同步完成：上传 %1$s，拉取 %2$d 个会话</string>
+    <string name="sync_done">同步完成：拉取 %1$d 个会话 · 上传 %2$d 张图片</string>
     <string name="sync_test_ok">连接成功</string>
     <string name="sync_need_config">先填服务器地址、账号与应用密码</string>
     <string name="sync_err_url">服务器地址无效（需要 http:// 或 https://）</string>
@@ -547,6 +547,8 @@
     <string name="sync_err_not_found">找不到这个路径：检查服务器地址与「远程文件」</string>
     <string name="sync_err_no_folder">云端目录建不出来：试试把「远程文件」改成更短的一层路径</string>
     <string name="sync_err_network">网络错误：%1$s</string>
-    <string name="sync_hint">坚果云：地址填 https://dav.jianguoyun.com/dav/，密码用「第三方应用密码」。同步文件是一份完整备份，含图片，会话多时会比较大。</string>
+    <string name="sync_note_broken">（跳过 %1$d 行损坏数据）</string>
+    <string name="sync_note_legacy">（云端的旧格式文件已被新格式替换）</string>
+    <string name="sync_hint">坚果云：地址填 https://dav.jianguoyun.com/dav/，密码用「第三方应用密码」。同步文件是逐行 JSON（一行一个会话），图片单独存在同目录的 media/ 下，所以会话再多也不会整份读进内存。</string>
 </resources>
 

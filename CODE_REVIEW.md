@@ -153,15 +153,44 @@ java.lang.NullPointerException: Attempt to invoke virtual method
 - 两处 `language` / `voice` 赋值都包了 `runCatching`：换引擎、音色被删、ROM 差异
   都不该让进程挂掉 —— 朗读是可选功能，最坏结果应该是"点了没声"。
 
+## 10（高，v1.2.1）同步 OOM：载荷格式重做
+
+**现象**：真机第一次同步直接 `OutOfMemoryError`。
+
+**根因**（三处叠加，都是"整份在内存里"）：
+
+1. `exportBackup()` 生成一个几兆～上百兆的 `String`；
+2. 图片以 base64 内联在 `messages.attachments` 里，一张 3MB 的照片 = 4MB 文本；
+3. 远端下载是 `response.body.bytes()`，本地导出又要建第二个完整副本（一次同步最多同时存在
+   5~6 份数据：下载字节 → 解析后的对象 → 本地字符串 → 解析后的对象 → 合并结果 → 上传字节）。
+
+**改法**（`data/sync/`）：
+
+| 以前 | 现在 |
+|---|---|
+| 一个大 JSON（`BackupFile`） | **JSONL**：首行 header（含预设），之后一行一个会话 |
+| 图片 base64 内联 | 图片按 **sha256 前 32 位**命名，单独存 `media/`；JSON 只留文件名 |
+| `bytes()` 下载 → `ByteArray` | `downloadToFile()` 边读边写临时文件 |
+| 上传 `ByteArray.toRequestBody()` | `File.asRequestBody()`，OkHttp 自己流式发 |
+| `messages.getAllRaw()` 全量读 | `stamps()` 只取 id+时间戳，再逐个 `getAllFor(id)` |
+| 合并需要两份完整对象 | 逐行读 → 逐条判定 → 写成 incoming 临时文件 → `Sequence` 流式导入 |
+
+**顺带**：内容寻址让"同一张图"在两端名字一致（不重复传、天然去重）；
+单行坏掉只跳过那一行并计数，不会让整次同步失败。
+
+**新增测试**：`SyncPayloadTest`（8 条）钉住"一行一个会话 / 图片只留文件名 / 坏行隔离 /
+旧格式拒绝"，以及 `shouldPull` / `newerPresets` 的边界（时间相等保留本地）。
+
 ## 其它记录（不改，但值得知道）
 
 - **`AppContainer.openCodeSessionId`** 每次启动随机生成，而它被当作 OpenCode Go 的
   `x-opencode-session` 发出去。作者注释里已标为待办；对普通对话无影响。
 - **`App.onCreate` 的明文 Key 迁移**是 fire-and-forget 协程，进程被杀可能不完成。
   好在该操作幂等，下次启动会再来一次。
-- **`exportBackup()` / 同步上传**都会把整份备份建在内存里（含图片 base64）。
-  几百个带图会话时有 OOM 风险。要彻底解决得改成流式导出（`ChatArchive` 已有流式的先例），
-  但那会改动备份写入协议，不在本次范围内 —— 已在 README 的「限制」里写明。
+- **`exportBackup()` / 导入**仍会把整份备份建在内存里（含图片 base64）：几百个带图会话时
+  有 OOM 风险。**同步已经在 v1.2.1 改成流式**（见第 10 条），但「导出所有数据」这条链
+  没动 —— 它要产出"一份能被整份导入的文件"，格式本身就是大 JSON，改流式得连读写协议一起换。
+  已在 README 的「限制」里写明。
 - **`HistoryViewModel.query` 与 `queryFlow`** 是同一份状态的两份拷贝，靠 `updateQuery` 手动同步。
   当前只有一个写入口，没有实际漂移；属于"能接受但脆"的写法。
 - **月份分组的"当前"语义**：分组只在 `conversations` 变化时重算，跨月时标题不会自己刷新。

@@ -4,7 +4,7 @@
 
 **[中文](README.md) | English**
 
-![Version](https://img.shields.io/badge/version-1.2.0-blue)
+![Version](https://img.shields.io/badge/version-1.2.1-blue)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ## What this is
@@ -17,7 +17,7 @@ targeted changes and a few real bug fixes (see [CODE_REVIEW.md](CODE_REVIEW.md))
 |---|---|
 | **Images above the bubble** | Sent images render as fixed 104dp square previews **above** the message bubble (up to three per row, `Crop`), tap to view full screen, long-press for the message menu. Image-only messages no longer draw an empty bubble. |
 | **History grouped by month** | The drawer goes from Today / Yesterday / Past 7 days / Earlier to **Pinned + one group per month** (`November 2026`). The old buckets ended up stuffing ~90% of a long history into "Earlier". |
-| **WebDAV sync** | Settings → Cloud sync. Reads and writes one full backup on your own drive (Nutstore, Nextcloud, Synology…), merging per conversation by `updatedAt` (last-write-wins). Optional sync on launch, manual sync, connection test. Password is stored as Keystore-encrypted ciphertext. |
+| **WebDAV sync (streaming)** | Settings → Cloud sync. The payload is **line-delimited JSON** (one chat per line) and images are uploaded separately under `media/` keyed by content hash — nothing ever loads the whole library into memory. Merging is per conversation by `updatedAt` (last-write-wins). Optional sync on launch, manual sync, connection test. |
 | **Fix: sent images were never written to disk** | Picked photos were inlined as base64 into `messages.attachments`; one 3 MB photo made a 4 MB row, past Android's 2 MB `CursorWindow` limit, so that conversation became unreadable and the image was silently dropped by the fallback path. Now the send path offloads like the import path always did. |
 | **Fix: deleting a message leaked image files** | Files exclusively owned by deleted messages (and their refs) are now reclaimed. |
 | **Fix: Keystore decryption on the main thread** | The settings flow now reads on IO. |
@@ -97,16 +97,32 @@ Settings → Cloud sync. Four fields: server URL, account, app password, remote 
 - **HTTPS only**: cleartext HTTP is blocked since Android 9 and `usesCleartextTraffic` is not
   enabled. For a LAN server (Synology, Raspberry Pi) put a TLS certificate or a reverse proxy in front.
 
-How it works: download the remote JSON (absent = empty) → take the newer side **per conversation
-and per preset** → upload the merged full snapshot.
+On the drive:
+
+```
+myDeepSeek/
+├─ sync.jsonl   line 1 = header (format/version/presets), then one chat per line
+└─ media/       images named by content hash (first 32 chars of sha256)
+```
+
+**Images are not base64 in the JSON.** A 3 MB photo becomes 4 MB of base64, which made a single
+line megabytes long and forced whole-file reads — that was the OOM. Now the JSON only carries the
+file name; the bytes travel as their own file, and because the name is the content hash, "same name"
+means "same content" (free dedup).
+
+How it works: stream the remote `sync.jsonl` to a cache file → parse it **line by line**, keeping
+only chats whose `updatedAt` is newer → fetch missing images → delete superseded local chats (drafts
+are preserved) → stream them back in. Then the same in reverse for upload. Peak memory tracks the
+**largest single chat**, not the library size.
 
 Known limits:
 
-- **Deletions do not propagate.** A conversation deleted on device A comes back from device B's
-  next sync. Fixing it needs tombstones; not worth it for personal use.
-- **Whole-file transfer.** Every sync rewrites the entire backup, images included (base64 adds ~33%).
-- **The remote file is plaintext JSON.** It contains your chat text and images — use a drive you trust,
-  or leave auto-sync off.
+- **Deletions do not propagate.** A conversation deleted on device A comes back from B's next sync.
+- **Deleted media is not reclaimed.** Images live on as orphan files under `media/`; that keeps other
+  chats' images safe, at the cost of some leftovers you can prune by hand.
+- **Attachments whose local file is gone are synced without the image** rather than uploading garbage.
+- **The drive copy is plaintext.** `sync.jsonl` is readable JSON and images are originals — use a drive
+  you trust, or leave auto-sync off.
 
 ## Privacy
 

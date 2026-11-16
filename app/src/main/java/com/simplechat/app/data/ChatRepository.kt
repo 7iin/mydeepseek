@@ -11,6 +11,7 @@ import com.simplechat.app.db.CompactionEntity
 import com.simplechat.app.db.ConversationEntity
 import com.simplechat.app.db.ConversationPresetEntity
 import com.simplechat.app.db.ConversationSearchHit
+import com.simplechat.app.db.ConversationStamp
 import com.simplechat.app.db.DraftEntity
 import com.simplechat.app.db.MessageEntity
 import com.simplechat.app.db.MessageTree
@@ -1099,6 +1100,46 @@ class ChatRepository(private val db: AppDatabase, private val context: Context) 
      */
     suspend fun importParsed(file: BackupFile, mode: ImportMode): ImportReport =
         importStream(file.conversations.asSequence(), file.presets, mode, expected = file.conversations.size)
+
+    // ── 同步：流式导出 / 流式导入 ─────────────────────────
+    //
+    // 同步刻意**不复用** exportBackup()：那一个把整个库建在一个 BackupFile 里，
+    // 峰值内存 = 会话 + 正文 + 全部图片 base64 之和。几百个带图会话就是几百兆，
+    // 实测直接 OOM。下面这四个方法服务的是"一次只碰一个会话"的流式路径。
+
+    /** 会话 id + updatedAt —— 同步判定"远端这条要不要拉"用。 */
+    internal suspend fun syncStamps(): List<ConversationStamp> = conversations.stamps()
+
+    /**
+     * 导出**单个会话**的备份模型。
+     *
+     * 与 [exportConversation] 的区别：**不把落盘图片读回 base64**。
+     * 同步的图片单独走文件（见 `SyncManager`），JSON 里只留文件名，
+     * 所以这里必须保留 `path` 原样、让 `data` 保持空。
+     */
+    internal suspend fun backupConversationForSync(id: String): BackupConversation? {
+        val row = conversations.findById(id) ?: return null
+        return row.toBackup(
+            messages = messages.getAllFor(id),
+            presetIds = conversationPresets.getFor(id)
+                .sortedBy { it.sortOrder }
+                .map { it.presetId },
+        )
+    }
+
+    /** 同步用的预设快照（很小，直接进载荷的第一行）。 */
+    internal suspend fun syncPresets(): List<BackupPreset> = presets.getAll().map { it.toBackup() }
+
+    /**
+     * **流式**导入：一条一条消费，不把整份备份建在内存里。
+     *
+     * 落库仍走 [importStream] —— 分批事务、坏行隔离、失败对账都是现成的，
+     * 这里只是把"来源"从 `List` 换成 `Sequence`。
+     */
+    internal suspend fun importSyncStream(
+        conversations: Sequence<BackupConversation>,
+        presetsToWrite: List<BackupPreset>,
+    ): ImportReport = importStream(conversations, presetsToWrite, ImportMode.MERGE)
 
     /**
      * **流式**导入：逐批取会话、逐批写库。

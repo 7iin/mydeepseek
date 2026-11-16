@@ -2,26 +2,34 @@ package com.simplechat.app.data.sync
 
 import com.simplechat.app.R
 import com.simplechat.app.data.AppTextException
+import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 import okhttp3.Credentials
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Request
-import okhttp3.Response
+import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 
 /**
- * 一个够用的 WebDAV 客户端：**PUT / GET / MKCOL / PROPFIND**，别的一概不做。
+ * 一个够用的 WebDAV 客户端：**PUT / GET / HEAD / MKCOL / PROPFIND**，别的一概不做。
  *
  * ### 为什么自己写而不引第三方库
  *
  * 同步只需要"把一个文件读回来、写回去"。sardine / dav4jvm 这类库带进的是
  * 一整套 DAV 对象模型（多级属性、锁、配额、ACL…），而真正会踩的坑只有三个：
  * 认证方式、父目录不存在、以及不同网盘的返回码脾气。这三件事自己处理反而更短。
+ *
+ * ### 全都按**文件**收发，不经过 ByteArray
+ *
+ * 载荷可能有几十兆（几百个会话的正文），整包读进内存就是一次 OOM。
+ * 上传用 `asRequestBody(file)` 由 OkHttp 边读边发，下载直接写文件流。
  *
  * ### 兼容性上的几条硬规则
  *
@@ -42,7 +50,7 @@ class WebDavClient(
         val server: String,
         val user: String,
         val password: String,
-        /** 远程文件路径，形如 `myDeepSeek/backup.json`。 */
+        /** 远程文件路径，形如 `myDeepSeek/sync.jsonl`。 */
         val path: String,
     )
 
@@ -72,23 +80,40 @@ class WebDavClient(
         }
     }
 
-    /** 下载远程文件；**404 返回 null**（第一次同步时远端还没有这个文件）。 */
-    fun download(config: Config): ByteArray? {
-        val request = authorized(config, targetUrl(config)).get().build()
-        call(request).use { response ->
-            return when {
-                response.code == 404 -> null
+    /**
+     * 把远程文件**流式**下载到 [target]。
+     *
+     * @return false 表示远端还没有这个文件（第一次同步），不是错误。
+     */
+    fun downloadToFile(config: Config, remotePath: String, target: File): Boolean {
+        val request = authorized(config, targetUrl(config, remotePath)).get().build()
+        return call(request).use { response ->
+            when {
+                response.code == 404 -> false
                 !response.isSuccessful -> throw httpError(response)
-                else -> response.body?.bytes()
+                else -> {
+                    val body = response.body ?: throw AppTextException(R.string.sync_err_network, "empty body")
+                    target.parentFile?.mkdirs()
+                    // 边读边写：不把整包读进内存
+                    body.byteStream().use { input ->
+                        target.outputStream().use { output -> input.copyTo(output, Buffer) }
+                    }
+                    true
+                }
             }
         }
     }
 
-    /** 上传（整体覆盖）。父目录不存在时自动补建后重试一次。 */
-    fun upload(config: Config, bytes: ByteArray) {
+    /** 上传一个本地文件（整体覆盖）。父目录不存在时自动补建后重试一次。 */
+    fun uploadFile(
+        config: Config,
+        remotePath: String,
+        file: File,
+        mediaType: MediaType = OctetStream,
+    ) {
         fun put(): Response = call(
-            authorized(config, targetUrl(config))
-                .put(bytes.toRequestBody(JsonMedia))
+            authorized(config, targetUrl(config, remotePath))
+                .put(file.asRequestBody(mediaType))
                 .build(),
         )
 
@@ -97,7 +122,7 @@ class WebDavClient(
             // 父目录不存在：逐级 MKCOL 之后重试一次。409 也可能来自服务端的其它限制，
             // 所以第二次再 409 就如实报错，不无限重试。
             response.close()
-            ensureParentCollections(config)
+            ensureParentCollections(config, remotePath)
             response = put()
         }
 
@@ -106,6 +131,24 @@ class WebDavClient(
                 result.isSuccessful -> Unit
                 result.code == 409 -> throw AppTextException(R.string.sync_err_no_folder)
                 else -> throw httpError(result)
+            }
+        }
+    }
+
+    /**
+     * 远端是否存在这个文件（`HEAD`）。
+     *
+     * 图片上传前先用它判一下 —— 内容寻址的名字不变就意味着内容没变，
+     * 没必要每次都把几十兆图片重传一遍。
+     */
+    fun exists(config: Config, remotePath: String): Boolean {
+        val request = authorized(config, targetUrl(config, remotePath)).head().build()
+        return call(request).use { response ->
+            when {
+                response.isSuccessful -> true
+                response.code == 404 -> false
+                response.code == 405 -> false // 有的服务端不许 HEAD：当作"没有"，随后会 PUT
+                else -> throw httpError(response)
             }
         }
     }
@@ -119,8 +162,8 @@ class WebDavClient(
      * 两者都是想要的结果；真的建不出来时，随后的 PUT 会再报一次 409，
      * 那时才该让用户看到错误。
      */
-    private fun ensureParentCollections(config: Config) {
-        val segments = pathSegments(config)
+    private fun ensureParentCollections(config: Config, remotePath: String) {
+        val segments = pathSegments(remotePath)
         if (segments.size <= 1) return
 
         var url = baseUrl(config)
@@ -150,16 +193,16 @@ class WebDavClient(
         config.server.trim().toHttpUrlOrNull()
             ?: throw AppTextException(R.string.sync_err_url)
 
-    private fun targetUrl(config: Config): HttpUrl {
+    private fun targetUrl(config: Config, remotePath: String): HttpUrl {
         var url = baseUrl(config)
-        pathSegments(config).forEach { segment ->
+        pathSegments(remotePath).forEach { segment ->
             url = url.newBuilder().addPathSegment(segment).build()
         }
         return url
     }
 
-    private fun pathSegments(config: Config): List<String> =
-        config.path.split('/').map { it.trim() }.filter { it.isNotEmpty() }
+    private fun pathSegments(path: String): List<String> =
+        path.split('/').map { it.trim() }.filter { it.isNotEmpty() }
 
     private fun httpError(response: Response): Throwable = when (response.code) {
         401 -> AppTextException(R.string.sync_err_auth)
@@ -171,9 +214,15 @@ class WebDavClient(
 
     companion object {
         private val JsonMedia = "application/json; charset=utf-8".toMediaType()
+        private val OctetStream = "application/octet-stream".toMediaType()
         private val XmlMedia = "application/xml; charset=utf-8".toMediaType()
 
+        private const val Buffer = 64 * 1024
+
         private const val UserAgent = "myDeepSeek-Android"
+
+        /** 同步文件本身用 JSON 的 MIME，便于网盘按类型识别/预览。 */
+        val SyncPayloadMedia: MediaType = JsonMedia
 
         /**
          * 同步用的独立 OkHttp 客户端。

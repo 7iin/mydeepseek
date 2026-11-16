@@ -535,7 +535,7 @@
     <string name="sync_stage_download">Downloading the remote backup…</string>
     <string name="sync_stage_merge">Merging…</string>
     <string name="sync_stage_upload">Uploading…</string>
-    <string name="sync_done">Synced: uploaded %1$s, pulled %2$d chats</string>
+    <string name="sync_done">Synced: pulled %1$d chats · uploaded %2$d images</string>
     <string name="sync_test_ok">Connected</string>
     <string name="sync_need_config">Fill in the server URL, account and app password first</string>
     <string name="sync_err_url">Invalid server URL (http:// or https:// required)</string>
@@ -547,6 +547,8 @@
     <string name="sync_err_not_found">Path not found: check the server URL and the remote file path</string>
     <string name="sync_err_no_folder">Could not create the remote folder: try a shallower remote file path</string>
     <string name="sync_err_network">Network error: %1$s</string>
-    <string name="sync_hint">Nutstore: use https://dav.jianguoyun.com/dav/ with an app password. The synced file is a full backup including images, so it grows with your chats.</string>
+    <string name="sync_note_broken"> (skipped %1$d damaged lines)</string>
+    <string name="sync_note_legacy"> (the old-format remote file was replaced)</string>
+    <string name="sync_hint">Nutstore: use https://dav.jianguoyun.com/dav/ with an app password. The sync file is line-delimited JSON (one chat per line) and images live under media/, so nothing loads the whole library at once.</string>
 </resources>
 

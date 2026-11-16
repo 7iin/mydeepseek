@@ -97,6 +97,48 @@ object AttachmentFiles {
         return size.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
     }
 
+    /** 落盘附件对应的文件（同步上传要用）。名字非法时返回 null。 */
+    fun fileOf(context: Context, name: String?): File? {
+        if (name.isNullOrBlank()) return null
+        // 只接受我们自己生成的文件名，杜绝用 ".." 之类穿越出去
+        if (name.contains('/') || name.contains('\\')) return null
+        return File(dirOf(context), name)
+    }
+
+    /**
+     * 把附件字节换成**内容寻址**的文件名（sha256 前 32 位 + 扩展名）。
+     *
+     * 同步的图片不走 JSON：JSON 里只留这个名字，字节单独上传。用内容哈希而不是
+     * UUID 有三个好处 —— 两台设备对同一张图算出同一个名字（不必重复上传）、
+     * 天然去重、名字本身就是校验值。
+     *
+     * 文件不存在时返回 null（原件缺失），调用方按"这张图没同步上去"处理。
+     */
+    fun contentAddressed(context: Context, attachment: Attachment): String? {
+        val bytes = when {
+            attachment.isStored -> read(context, attachment.path)
+            attachment.data.isNotEmpty() -> runCatching {
+                Base64.decode(attachment.data, Base64.NO_WRAP)
+            }.getOrNull()
+            else -> null
+        } ?: return null
+
+        val name = digest(bytes) + extensionOf(attachment.mime)
+        val target = File(dirOf(context), name)
+        if (!target.isFile) {
+            runCatching {
+                if (!target.parentFile!!.exists()) target.parentFile!!.mkdirs()
+                target.outputStream().use { it.write(bytes) }
+            }.getOrNull() ?: return null
+        }
+        return name
+    }
+
+    private fun digest(bytes: ByteArray): String =
+        java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+            .joinToString("") { byte -> "%02x".format(byte) }
+            .take(32)
+
     private fun dirOf(context: Context): File = File(context.filesDir, Dir)
 
     /** MIME → 扩展名。认不出就不带后缀（内容靠 MIME 字段说明，不靠文件名）。 */

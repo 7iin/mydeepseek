@@ -73,7 +73,8 @@ class AppContainer(private val app: Application) {
     private val webDavClient: WebDavClient by lazy { WebDavClient() }
 
     val syncManager: SyncManager by lazy {
-        SyncManager(chatRepository, settingsStore, webDavClient)
+        // 传 app（Application）而不是 Activity：同步作用域比任何页面都活得久
+        SyncManager(app, chatRepository, settingsStore, webDavClient)
     }
 
     /**

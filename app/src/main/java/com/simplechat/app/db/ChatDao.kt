@@ -79,6 +79,15 @@ interface ConversationDao {
     @Query("SELECT COUNT(*) FROM conversations")
     suspend fun count(): Int
 
+    /**
+     * 同步只需要"有哪些会话、各自什么时候改的"。
+     *
+     * 刻意**不查整行**：同步要先知道"远端哪些更新"，而那是一个 id+时间戳的
+     * 小表；把 `systemPrompt` 之类一起读回来纯属浪费。返回顺序固定，导出可复现。
+     */
+    @Query("SELECT id, updatedAt FROM conversations ORDER BY updatedAt DESC, id ASC")
+    suspend fun stamps(): List<ConversationStamp>
+
     /** 导出用：全量（含未激活的历史版本）。 */
     @Query("SELECT * FROM conversations ORDER BY createdAt ASC")
     suspend fun getAllRaw(): List<ConversationEntity>
@@ -109,6 +118,12 @@ interface ConversationDao {
  *
  * [snippet] 为 null 表示只有**标题**命中，没有正文片段可显示。
  */
+/** 会话的最小投影：同步判定"要不要拉"用。 */
+data class ConversationStamp(
+    val id: String,
+    val updatedAt: Long,
+)
+
 data class ConversationSearchHit(
     @Embedded val conversation: ConversationEntity,
     val snippet: String?,
