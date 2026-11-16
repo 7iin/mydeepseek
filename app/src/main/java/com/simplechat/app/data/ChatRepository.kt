@@ -1,0 +1,1456 @@
+package com.simplechat.app.data
+
+import android.content.Context
+import android.util.Base64
+import android.database.sqlite.SQLiteBlobTooBigException
+import androidx.room.withTransaction
+import com.simplechat.app.R
+import com.simplechat.app.db.AppDatabase
+import com.simplechat.app.db.AttachmentRefEntity
+import com.simplechat.app.db.CompactionEntity
+import com.simplechat.app.db.ConversationEntity
+import com.simplechat.app.db.ConversationPresetEntity
+import com.simplechat.app.db.ConversationSearchHit
+import com.simplechat.app.db.DraftEntity
+import com.simplechat.app.db.MessageEntity
+import com.simplechat.app.db.MessageTree
+import com.simplechat.app.db.PresetEntity
+import com.simplechat.app.data.import.DeepSeekHistory
+import com.simplechat.app.data.import.ExternalBackup
+import com.simplechat.app.data.archive.ChatArchive
+import com.simplechat.app.net.ReplyBlock
+import com.simplechat.app.net.ReplyBlocks
+import com.simplechat.app.ui.chat.ConversationMode
+import java.io.File
+import java.util.zip.ZipFile
+import com.simplechat.app.ui.chat.MessageRole
+import com.simplechat.app.ui.chat.MessageStatus
+import com.simplechat.app.ui.chat.Preset
+import com.simplechat.app.ui.chat.UiMessage
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.UUID
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.map
+
+/**
+ * 落库前的归一：空文本返回 `null`（= 删行、不留空壳），超长**截尾**到
+ * [DraftEntity.MaxChars]（只截落库的那份，界面上照旧）。
+ */
+internal fun draftForStorage(text: String): String? =
+    if (text.isEmpty()) null else text.take(DraftEntity.MaxChars)
+
+/**
+ * 待用标题的归一：`trim` 之后为空 / 全空白一律当**没起过名**。
+ *
+ * 空白标题比"新对话"更糟 —— 顶栏会空着一行，抽屉里那条也认不出来。
+ */
+internal fun titleForStorage(title: String?): String? = title?.trim()?.takeIf { it.isNotBlank() }
+
+/**
+ * 会话与消息的持久化门面。
+ *
+ * 两条通道刻意分开：
+ * - **列表页**走 Room 的 `Flow`，天然响应式（重命名 / 置顶 / 删除立刻反映）。
+ * - **对话流**以内存中的 `SnapshotStateList` 为准，按 §4.4 的策略**节流 checkpoint 落库**。
+ *   若让每个 token 都回写 Room，一次 2000 字回复就是 2000 次磁盘事务。
+ */
+class ChatRepository(private val db: AppDatabase, private val context: Context) {
+
+    private val conversations = db.conversationDao()
+    private val messages = db.messageDao()
+    private val presets = db.presetDao()
+    private val conversationPresets = db.conversationPresetDao()
+    private val compactionDao = db.compactionDao()
+    private val drafts = db.draftDao()
+    private val attachmentRefs = db.attachmentRefDao()
+
+    // ── 会话列表 ──────────────────────────────────────────
+
+    fun observeConversations(): Flow<List<ConversationEntity>> = conversations.observeAll()
+
+    /**
+     * 观察**单个会话**。
+     *
+     * 存在的理由只有一个：让「标题」有唯一真相。
+     * 顶栏、抽屉、对话设置里的名称框都从这一列读，谁改了都从库流回来。
+     */
+    fun observeConversation(id: String): Flow<ConversationEntity?> = conversations.observeById(id)
+
+    /** 全文搜索：标题或**消息正文**命中。 */
+    fun searchConversations(query: String): Flow<List<ConversationSearchHit>> =
+        conversations.search(query.trim())
+
+    fun observePresets(): Flow<List<Preset>> = presets.observeAll().map { list -> list.map { it.toUi() } }
+
+    suspend fun createConversation(
+        mode: ConversationMode,
+        provider: String,
+        model: String,
+        systemPrompt: String? = null,
+        enabledPresetIds: List<String> = emptyList(),
+        title: String = Res.get(R.string.conversation_default_title),
+    ): String = db.withTransaction {
+        val now = System.currentTimeMillis()
+        val id = UUID.randomUUID().toString()
+        conversations.upsert(
+            ConversationEntity(
+                id = id,
+                title = title.trim().ifBlank { Res.get(R.string.conversation_default_title) },
+                mode = mode.toStorage(),
+                provider = provider,
+                model = model,
+                systemPrompt = systemPrompt?.trim()?.takeIf { it.isNotBlank() },
+                createdAt = now,
+                updatedAt = now,
+            ),
+        )
+        writePresetLinks(id, enabledPresetIds)
+        id
+    }
+
+    /**
+     * 写入会话级设置：补充提示词 + 挂载的预设。
+     *
+     * ⚠️ 这两项**属于会话，不属于全局设置**。先前只在建会话那一刻写一次，
+     * 之后在 ⚙ 面板里改了就不作数 —— 切走再切回来会退回旧值，
+     * 预设更是从来没被写进去过（`openConversation` 也从不读它）。
+     */
+    suspend fun setConversationSettings(
+        conversationId: String,
+        systemPrompt: String,
+        enabledPresetIds: List<String>,
+    ) = db.withTransaction {
+        conversations.setSystemPrompt(
+            conversationId,
+            systemPrompt.trim().takeIf { it.isNotBlank() },
+        )
+        writePresetLinks(conversationId, enabledPresetIds)
+    }
+
+    /** 该会话挂载的预设 id，按拼接顺序。 */
+    suspend fun getEnabledPresetIds(conversationId: String): List<String> =
+        conversationPresets.getFor(conversationId)
+            .filter { it.enabled }
+            .map { it.presetId }
+
+    /** 预设挂载关系：**先清后写**，`sortOrder` 即拼接顺序。 */
+    private suspend fun writePresetLinks(conversationId: String, presetIds: List<String>) {
+        conversationPresets.clear(conversationId)
+        if (presetIds.isEmpty()) return
+        conversationPresets.upsertAll(
+            presetIds.mapIndexed { index, presetId ->
+                ConversationPresetEntity(
+                    conversationId = conversationId,
+                    presetId = presetId,
+                    sortOrder = index,
+                    enabled = true,
+                )
+            },
+        )
+    }
+
+    suspend fun findConversation(id: String): ConversationEntity? = conversations.findById(id)
+
+    suspend fun renameConversation(id: String, title: String) =
+        conversations.rename(
+            id,
+            title.trim().ifBlank { Res.get(R.string.conversation_default_title) },
+            System.currentTimeMillis(),
+        )
+
+    suspend fun setPinned(id: String, pinned: Boolean) =
+        conversations.setPinned(id, pinned, if (pinned) System.currentTimeMillis() else null)
+
+    suspend fun deleteConversations(ids: List<String>) {
+        /*
+         * 落盘图片的路径从**引用表**查，不读 `messages.attachments` ——
+         * 那一列是几兆的大 JSON，读它必然撞 `CursorWindow` 的 2MB 上限
+         * （实测「删除所有历史对话」就是这么失败的：
+         * `Row too big to fit into CursorWindow requiredPos=954`）。
+         */
+        val files = ids.flatMap { attachmentRefs.pathsOf(it) }
+        db.withTransaction {
+            conversations.deleteAll(ids)
+            // 会话没了草稿就没人读 —— 同步清掉，别留死数据
+            drafts.clearAll(ids)
+            attachmentRefs.clearAll(ids)
+        }
+        files.forEach { AttachmentFiles.delete(context, it) }
+    }
+
+    /**
+     * 写库前把**内联**的图片字节搬到磁盘。
+     *
+     * 备份里图片是 base64 内联的（格式不变），直接写进库又会回到"一行几兆、
+     * 读不出来"的老问题。所有导入路径（自家备份 / Chatbox / DeepSeek）都经过
+     * [writeConversation]，所以在这里统一落盘，等于给整条链路上了保险。
+     */
+    private fun MessageEntity.withOffloadedImages(): MessageEntity {
+        val decoded = Attachments.decode(attachments)
+        if (decoded.none { it.isImage && !it.isStored }) return this
+        val offloaded = decoded.map { attachment ->
+            if (!attachment.isImage || attachment.isStored) return@map attachment
+            val bytes = runCatching { Base64.decode(attachment.data, Base64.NO_WRAP) }.getOrNull()
+                ?: return@map attachment
+            val stored = AttachmentFiles.save(context, bytes, attachment.mime)
+                ?: return@map attachment
+            attachment.copy(data = "", path = stored)
+        }
+        return copy(attachments = Attachments.encode(offloaded))
+    }
+
+
+
+    suspend fun touchConversation(id: String) = conversations.touch(id, System.currentTimeMillis())
+
+    // ── 会话分叉：「从这里新建对话」（§21）──────────────────
+
+    /**
+     * 把活跃路径上到 [fromMessageId] 为止的那一段，复制成一个**独立的新会话**。
+     *
+     * **原会话一个字节都不动** —— 这是这个功能的全部意义。
+     *
+     * - 只复制**当前选中的那一版**，不搬兄弟版本；新会话里全是单版本
+     * - 消息 id 全部重挂（沿用旧 id 会撞主键），`parentId` 重新串成一条新链
+     * - 会话级设置（模式 / Provider / 模型 / 系统提示词 / 挂载的预设）一并复制
+     * - **压缩摘要不复制**：被它盖住的原文本来就在复制范围内，摘要是多余的
+     * - 消息**保留原始 `createdAt`**：它记录的是"这些话什么时候写的"，
+     *   重盖时间戳会让历史失真（树序本来也不依赖时间）
+     *
+     * @return 新会话 id；目标不在活跃路径上时返回 null
+     */
+    suspend fun forkConversation(fromMessageId: String): String? = db.withTransaction {
+        val source = messages.findById(fromMessageId) ?: return@withTransaction null
+        val origin = conversations.findById(source.conversationId) ?: return@withTransaction null
+
+        val path = MessageTree.pathTo(messages.getAllFor(source.conversationId), fromMessageId)
+        if (path.isEmpty()) return@withTransaction null
+
+        val now = System.currentTimeMillis()
+        val newId = UUID.randomUUID().toString()
+
+        conversations.upsert(
+            ConversationEntity(
+                id = newId,
+                title = forkedTitle(origin.title),
+                mode = origin.mode,
+                provider = origin.provider,
+                model = origin.model,
+                systemPrompt = origin.systemPrompt,
+                pinned = false,
+                pinnedAt = null,
+                createdAt = now,
+                updatedAt = now,
+            ),
+        )
+        messages.upsertAll(
+            MessageTree.forkMessages(path, conversationId = newId) {
+                UUID.randomUUID().toString()
+            },
+        )
+        writePresetLinks(newId, getEnabledPresetIds(origin.id))
+
+        newId
+    }
+
+    /**
+     * 副本标题后缀。把已有的后缀剥掉，免得"副本的副本"一路叠下去。
+     * 中英两种后缀都要认 —— 会话可能建于另一种界面语言下。
+     */
+    private val forkSuffix = Regex("(（副本( \\d+)?）|\\(copy( \\d+)?\\))$")
+
+    /**
+     * 副本标题：`原标题（副本）`；同名已存在则 `（副本 2）`、`（副本 3）`…
+     *
+     * 会话列表靠标题区分，重名会让人根本认不出哪个是刚分出来的。
+     * 后缀随界面语言取（`conversation_fork_suffix*`）。
+     */
+    private suspend fun forkedTitle(title: String): String {
+        val base = title.replace(forkSuffix, "").ifBlank { title }
+        // 与导入的"同名新命名"共用一套编号规则（`uniqueCopyTitle`，纯函数有单测）
+        return uniqueCopyTitle(
+            title = base,
+            taken = conversations.allTitles().toHashSet(),
+            suffix = Res.get(R.string.conversation_fork_suffix),
+            suffixN = { n -> Res.get(R.string.conversation_fork_suffix_n, n) },
+        )
+    }
+
+    // ── 消息（树）─────────────────────────────────────────
+    //
+    // 一切以 `parentId` 为准，不再有"第几位"。当前对话 =
+    // `MessageTree.activePath(all)` 走出来的那条路径。
+
+    /** 当前对话：从根沿 active 走到底。 */
+    suspend fun loadActivePath(conversationId: String): List<UiMessage> {
+        val all = loadMessagesSafely(conversationId)
+        /*
+         * 映射放到后台线程。
+         *
+         * `toUi()` 要解 timeline / attachments 两段 JSON 并构造字符串，几百条消息
+         * 累计是几十毫秒级的活 —— 在调用方（主线程）上做，正好卡在"侧边栏收起来"
+         * 那段动画里，看起来就是动画一卡、然后内容才出现。
+         */
+        return withContext(Dispatchers.Default) {
+            val counts = MessageTree.siblingCounts(all)
+            MessageTree.activePath(all).map { entity ->
+                entity.toUi().copy(variantCount = counts[entity.parentId] ?: 1)
+            }
+        }
+    }
+
+    /** 路径末尾节点 id；空会话返回 [MessageEntity.ROOT_PARENT]。 */
+    /**
+     * 读一个会话的全部消息，**带超大行的兜底**。
+     *
+     * Android 的 `CursorWindow` 是 2MB：某一条消息的附件列（图片 base64）超过它，
+     * 整条 SQL 就抛 `SQLiteBlobTooBigException`，那个会话从列表点进去直接闪退 ——
+     * 一次导入几万条历史之后，这种行必然存在。
+     *
+     * 兜底策略：整行读不了就退到"截断附件"的查询。牺牲的只是那一条消息的图片，
+     * 正文、思考、时间线都还在，而且会话能打开。
+     */
+    private suspend fun loadMessagesSafely(conversationId: String): List<MessageEntity> =
+        runCatching { messages.getAllFor(conversationId) }
+            .getOrElse { error ->
+                if (error !is SQLiteBlobTooBigException) throw error
+                messages.getAllForCapped(conversationId, CappedAttachmentsChars)
+            }
+
+    suspend fun tailId(conversationId: String): String =
+        messages.getAllFor(conversationId)
+            .let { MessageTree.activePath(it).lastOrNull()?.id }
+            ?: MessageEntity.ROOT_PARENT
+
+    /**
+     * 在 [parentId] 下挂一个新兄弟并激活它。
+     *
+     * 「发送」「重新生成」「编辑」全都走这里 —— 区别只是挂在谁下面：
+     * - 发送：挂在当前路径末尾
+     * - 重新生成：挂在**被重新生成那条的父亲**下（于是成为它的兄弟）
+     * - 编辑：同上，旧的那条连同它的子树原样留着
+     */
+    private suspend fun addSibling(
+        conversationId: String,
+        parentId: String,
+        role: MessageRole,
+        content: String,
+        attachments: List<Attachment> = emptyList(),
+        reasoning: String? = null,
+        status: MessageStatus = MessageStatus.DONE,
+        /** 这条由哪个模型产生；用户消息传 null。 */
+        model: String? = null,
+    ): MessageEntity {
+        val id = UUID.randomUUID().toString()
+        /*
+         * ⚠️ 附件必须**落盘**再写库 —— 导入路径早就这么做，发送路径原先漏了。
+         *
+         * 拍照 / 相册来的图片是内联 base64 的：一张 3MB 的照片 ≈ 4MB 的 TEXT，
+         * 而 Android 的 `CursorWindow` 只有 2MB。写进去不会立刻报错，
+         * 但**这条会话从此读不出来**（`SQLiteBlobTooBigException`），
+         * 兜底路径会把附件截断 → 图片整张消失。
+         *
+         * 落盘之后行里只留文件名，顺带登记到 `attachment_refs`：
+         * 删会话时据此把字节一起清掉（那张表就是为了避开这一列的大 JSON）。
+         */
+        val entity = newMessageEntity(
+            id = id,
+            conversationId = conversationId,
+            parentId = parentId,
+            variantIndex = messages.nextVariantIndex(conversationId, parentId),
+            role = role,
+            content = content,
+            attachments = attachments,
+            reasoning = reasoning,
+            status = status,
+            model = model,
+        ).withOffloadedImages()
+
+        messages.upsert(entity)
+
+        val storedPaths = Attachments.decode(entity.attachments).mapNotNull { it.path }
+        if (storedPaths.isNotEmpty()) {
+            attachmentRefs.upsertAll(
+                storedPaths.map { path -> AttachmentRefEntity(path = path, conversationId = conversationId) },
+            )
+        }
+
+        messages.activate(id, conversationId, parentId)
+        return messages.findById(id)!!
+    }
+
+    /** 把实体包成 UI 模型，δ 补上兄弟数。 */
+    private suspend fun toUiWithCounts(conversationId: String, entity: MessageEntity): UiMessage {
+        val count = MessageTree.siblingCountsOf(messages.parentIds(conversationId))[entity.parentId] ?: 1
+        return entity.toUi().copy(variantCount = count)
+    }
+
+    /**
+     * 追加一条用户消息，返回它本身。
+     *
+     * 返回**真实 id** —— 早先调用方自己编了个 `local-user-<时间戳>`，
+     * 于是内存里的这条与库里的记录对不上，任何按 id 回查都会落空。
+     */
+    suspend fun appendUserMessage(
+        conversationId: String,
+        content: String,
+        attachments: List<Attachment> = emptyList(),
+    ): UiMessage =
+        db.withTransaction {
+            val parentId = tailId(conversationId)
+            val entity = addSibling(
+                conversationId = conversationId,
+                parentId = parentId,
+                role = MessageRole.USER,
+                content = content,
+                attachments = attachments,
+            )
+
+            val now = System.currentTimeMillis()
+            val conversation = conversations.findById(conversationId)
+            // 只有正文参与标题推导 —— 一条纯图片消息不该把标题变成"image.jpg"
+            val fallback = Res.get(R.string.conversation_default_title)
+            val title = if (conversation != null && isAutoTitle(conversation.title)) {
+                derivedTitle(content, fallback)
+            } else {
+                conversation?.title ?: fallback
+            }
+            conversations.rename(conversationId, title, now)
+
+            toUiWithCounts(conversationId, entity)
+        }
+
+    /** 新建一条 streaming 状态的 assistant，挂在 [parentId] 下。 */
+    suspend fun beginAssistantMessage(
+        conversationId: String,
+        parentId: String,
+        model: String? = null,
+    ): String =
+        addSibling(
+            conversationId = conversationId,
+            parentId = parentId,
+            role = MessageRole.ASSISTANT,
+            content = "",
+            reasoning = "",
+            status = MessageStatus.STREAMING,
+            model = model,
+        ).id
+
+    /** 流式 checkpoint。调用频率由 ViewModel 控制在 ~1.5s（§4.4）。 */
+    suspend fun checkpoint(
+        id: String,
+        content: String,
+        reasoning: String?,
+        timeline: List<ReplyBlock> = emptyList(),
+    ) = messages.checkpoint(
+        id = id,
+        content = content,
+        reasoning = reasoning,
+        status = MessageStatus.STREAMING.toStorage(),
+        timeline = ReplyBlocks.encode(timeline),
+    )
+
+    /**
+     * 把一条**失败**的消息原地重置，准备重新请求。
+     *
+     * 连同 `model` 一起写：重试用的是**当前**选的模型，不是当初失败的那个 ——
+     * 用户很可能就是换了模型才来点重试的。
+     */
+    suspend fun resetForRetry(id: String, model: String?) =
+        messages.resetForRetry(id, model, MessageStatus.STREAMING.toStorage())
+
+    /**
+     * 续写：原地转回流式，**内容保留**。
+     *
+     * 与 [resetForRetry] 相对：那个是"这次请求重来"，这个是"接着上一次写"。
+     */
+    suspend fun resumeStreaming(id: String) =
+        messages.resumeStreaming(id, MessageStatus.STREAMING.toStorage())
+
+    suspend fun finishMessage(
+        id: String,
+        content: String,
+        reasoning: String?,
+        status: MessageStatus,
+        errorMessage: String? = null,
+        ttftMs: Long? = null,
+        tps: Float? = null,
+        thinkingMs: Long? = null,
+        timeline: List<ReplyBlock> = emptyList(),
+        stopReason: String? = null,
+    ) = messages.finish(
+        id = id,
+        status = status.toStorage(),
+        error = errorMessage,
+        ttftMs = ttftMs,
+        tps = tps,
+        thinkingMs = thinkingMs,
+        timeline = ReplyBlocks.encode(timeline),
+        stopReason = stopReason,
+    ).also {
+        messages.checkpoint(
+            id = id,
+            content = content,
+            reasoning = reasoning,
+            status = status.toStorage(),
+            timeline = ReplyBlocks.encode(timeline),
+        )
+    }
+
+    /**
+     * 打开会话前清扫：把上次被中断的流式消息判为 STOPPED。
+     *
+     * 不做这一步，那条消息会以 STREAMING 状态永久留在库里 ——
+     * UI 上不给操作入口，用户既删不掉也切不走。
+     */
+    suspend fun resolveDanglingStreams(conversationId: String) =
+        messages.resolveDanglingStreams(conversationId, MessageStatus.STOPPED.toStorage())
+
+    /**
+     * 删除一条消息 —— **连同它的整棵子树**。
+     *
+     * 下游都是基于它生成的，留着一个"没有前文的下文"没有意义。
+     * 删完若父节点下再没有 active 的兄弟，让最后一个兄弟接管，
+     * 免得路径断在半途、后面全部不显示。
+     */
+    suspend fun deleteMessage(messageId: String) {
+        val node = messages.findById(messageId) ?: return
+        val all = messages.getAllFor(node.conversationId)
+        val doomed = MessageTree.subtreeIds(all, messageId)
+
+        /*
+         * 删消息也要收走它独占的图片文件。
+         *
+         * 原先只删行：字节留在 `filesDir/attachments/` 里再没人引用，
+         * 删得越多占得越多，而用户完全看不到这部分占用（它不在"对话"里）。
+         * 判据用**引用表**而不是"这条消息用过"—— 同一张图可能被编辑重发
+         * 复制进另一条消息，只要还有登记就不能删文件。
+         */
+        val paths = all.filter { it.id in doomed }
+            .flatMap { Attachments.decode(it.attachments) }
+            .mapNotNull { it.path }
+            .distinct()
+
+        messages.deleteByIds(doomed)
+        if (paths.isNotEmpty()) {
+            attachmentRefs.clearPaths(paths)
+            val stillReferenced = attachmentRefs.allPaths().toSet()
+            paths.filterNot { it in stillReferenced }.forEach { AttachmentFiles.delete(context, it) }
+        }
+
+        val remaining = messages.getAllFor(node.conversationId)
+        val siblings = remaining.filter { it.parentId == node.parentId }
+        if (siblings.isNotEmpty() && siblings.none { it.active }) {
+            MessageTree.lastSibling(remaining, node.parentId)?.let {
+                messages.activate(it.id, node.conversationId, node.parentId)
+            }
+        }
+    }
+
+    /** 切到某个版本。同一个父亲下只有它会 `active = 1`。 */
+    suspend fun activateVariant(messageId: String, conversationId: String, parentId: String) =
+        messages.activate(messageId, conversationId, parentId)
+
+    /**
+     * 在 [parentId] 下追加一个新版本并立即激活它。
+     *
+     * 「重新生成」与「编辑」都走这里。旧版本**连同它的子树**原样留着 ——
+     * 这就是"分支"：切回去的时候，旧分支的下游也一起回来。
+     */
+    suspend fun addActiveVariant(
+        conversationId: String,
+        parentId: String,
+        role: MessageRole,
+        content: String,
+        attachments: List<Attachment> = emptyList(),
+        reasoning: String? = null,
+        status: MessageStatus = MessageStatus.DONE,
+        ttftMs: Long? = null,
+        tps: Float? = null,
+        thinkingMs: Long? = null,
+    ): UiMessage = db.withTransaction {
+        val entity = addSibling(
+            conversationId = conversationId,
+            parentId = parentId,
+            role = role,
+            content = content,
+            attachments = attachments,
+            reasoning = reasoning,
+            status = status,
+        )
+        messages.finish(
+            id = entity.id,
+            status = status.toStorage(),
+            error = null,
+            ttftMs = ttftMs,
+            tps = tps,
+            thinkingMs = thinkingMs,
+            timeline = null,
+            stopReason = null,
+        )
+        toUiWithCounts(conversationId, messages.findById(entity.id)!!)
+    }
+
+    /** 某个父亲下、指定版本号对应的消息 id（切版本时用）。 */
+    suspend fun messageIdAt(
+        conversationId: String,
+        parentId: String,
+        variantIndex: Int,
+    ): String? = messages.getAllFor(conversationId)
+        .firstOrNull { it.parentId == parentId && it.variantIndex == variantIndex }
+        ?.id
+
+    /** 串行读取某个父亲下当前激活的版本。 */
+    suspend fun activeMessageAt(conversationId: String, parentId: String): UiMessage? {
+        // 同样走兜底：这条路径也在"点开会话"的链路上，超大行一样会崩
+        val all = loadMessagesSafely(conversationId)
+        val node = all.firstOrNull { it.parentId == parentId && it.active } ?: return null
+        val count = MessageTree.siblingCounts(all)[parentId] ?: 1
+        return node.toUi().copy(variantCount = count)
+    }
+
+    // ── 预设 ──────────────────────────────────────────────
+
+    /**
+     * 让库里的**内置预设**与代码保持一致（每次启动跑一次，很便宜）。
+     *
+     * 规则（不额外存"种子版本号"，靠时间戳区分）：
+     *
+     * - 内置预设**不存在** → 插入
+     * - 存在且**没被改过**（`createdAt == updatedAt`）→ 用代码里的最新文案覆盖
+     * - 存在但**被改过** → 原样不动（用户的手笔优先）
+     * - 已下线的旧内置预设（[retiredPresetIds]）且没被改过 → 删掉
+     *
+     * 于是开发期"改文案"是顺手的：改代码 → 下次启动自动生效，**不用清应用数据**；
+     * 而用户在界面上改过的预设不会被覆盖。
+     *
+     * ⚠️ `createdAt` 必须由 [upsertPreset] 保留 —— 它是这里唯一的"改过没"判据。
+     */
+    suspend fun reconcileBuiltInPresets() {
+        val now = System.currentTimeMillis()
+        val existing = presets.getAll().associateBy { it.id }
+
+        builtInPresets().forEachIndexed { index, preset ->
+            val row = existing[preset.id]
+            // 用户改过就跳过（updatedAt 被界面那条路径推后了）
+            if (row != null && row.updatedAt > row.createdAt) return@forEachIndexed
+            presets.upsert(
+                PresetEntity(
+                    id = preset.id,
+                    name = preset.name,
+                    content = preset.content,
+                    sortOrder = index,
+                    createdAt = row?.createdAt ?: now,
+                    updatedAt = now,
+                ),
+            )
+        }
+
+        // 上一代的内置预设：没被改过就清掉，免得列表里留着一批用不上的条目
+        retiredPresetIds.forEach { id ->
+            val row = existing[id] ?: return@forEach
+            if (row.updatedAt == row.createdAt) presets.delete(id)
+        }
+    }
+
+    suspend fun upsertPreset(preset: Preset, order: Int) {
+        val now = System.currentTimeMillis()
+        // ⚠️ 保留 createdAt —— 它是 reconcileBuiltInPresets 判断"这条被改过没"的依据
+        val createdAt = presets.findById(preset.id)?.createdAt ?: now
+        presets.upsert(
+            PresetEntity(
+                id = preset.id,
+                name = preset.name,
+                content = preset.content,
+                sortOrder = order,
+                createdAt = createdAt,
+                updatedAt = now,
+            ),
+        )
+    }
+
+    suspend fun deletePreset(id: String) = presets.delete(id)
+
+    // ── 压缩摘要 ──────────────────────────────────────────
+
+    suspend fun getCompactions(conversationId: String): List<CompactionEntity> =
+        compactionDao.getFor(conversationId)
+
+    suspend fun saveCompaction(compaction: CompactionEntity) = compactionDao.upsert(compaction)
+
+    suspend fun deleteCompaction(id: String) = compactionDao.delete(id)
+
+    // ── 未发送的输入草稿 ──────────────────────────────────
+
+    /**
+     * 读回草稿。[key] 是会话 id，还没有会话时是 [DraftEntity.NewConversation]。
+     *
+     * @return 没有草稿返回 `null`（调用方据此把输入框留空）。
+     */
+    suspend fun findDraft(key: String): String? = drafts.find(key)?.text
+
+    /** 「新对话」的待用标题。 */
+    suspend fun findDraftTitle(key: String): String? = drafts.find(key)?.title
+
+    /**
+     * 落草稿。
+     *
+     * - **空文本删行**（连同待用标题一起没有了才删）；
+     * - 超长**截尾**到 [DraftEntity.MaxChars] —— 只影响落库的那一份，界面上照旧。
+     */
+    suspend fun saveDraft(key: String, text: String) = mutateDraft(key) {
+        it.copy(text = draftForStorage(text).orEmpty(), updatedAt = System.currentTimeMillis())
+    }
+
+    /** 记下「新对话」的待用标题；空 / 空白即清掉。 */
+    suspend fun saveDraftTitle(key: String, title: String?) = mutateDraft(key) {
+        it.copy(title = titleForStorage(title), updatedAt = System.currentTimeMillis())
+    }
+
+    suspend fun clearDraft(key: String) = drafts.clear(key)
+
+    /**
+     * 行内两样东西（草稿正文 + 待用标题）共用一行，所以写入一律走这里 ——
+     * 否则 `upsert` 整行覆盖会把另一样悄悄抹掉。两样都空就删行。
+     */
+    private suspend fun mutateDraft(key: String, transform: (DraftEntity) -> DraftEntity) {
+        val current = drafts.find(key) ?: DraftEntity(key, "", System.currentTimeMillis())
+        val next = transform(current)
+        if (next.text.isEmpty() && next.title == null) {
+            drafts.clear(key)
+        } else {
+            drafts.upsert(next)
+        }
+    }
+
+    /** 验收用：现存草稿条数。 */
+    suspend fun draftCount(): Int = drafts.count()
+
+    // ── 备份：导出 / 导入 / 清空 ──────────────────────────
+
+    /** 删除全部会话。消息 / 预设挂载 / 摘要靠外键级联一并清除。 */
+    suspend fun deleteAllConversations() {
+        // 全清也要把落盘图片一起删干净：路径同样只查引用表，不碰 messages 的大列
+        val files = attachmentRefs.allPaths()
+        db.withTransaction {
+            conversations.deleteEverything()
+            drafts.clearEverything()
+            attachmentRefs.clearEverything()
+        }
+        files.forEach { AttachmentFiles.delete(context, it) }
+    }
+
+    suspend fun conversationCount(): Int = conversations.count()
+
+    /** 导出为可读的 JSON 文本。含**所有版本**，不只当前激活的。 */
+    suspend fun exportBackup(): String = backupJson.encodeToString(fullBackup())
+
+    /**
+     * 导出为 **ZIP 归档**：`manifest.json` + `backup.json` + 每个会话的 Markdown 文稿。
+     *
+     * 与 [exportBackup] 是**同一份数据**的两种形态 —— 消息、附件、预设、分支一个不少，
+     * 只是多了压缩外壳与可读文稿。图省事少写一套模型的收益在于：
+     * 以后加字段只改一处，不会出现"JSON 备份有、ZIP 备份没有"这种分叉。
+     */
+    suspend fun exportArchive(): ByteArray {
+        val backup = fullBackup()
+        val documents = conversations.getAllRaw().mapIndexed { index, row ->
+            ChatArchive.Document(
+                fileName = ChatArchive.documentName(index + 1, row.title),
+                markdown = exportConversationMarkdown(row.id).orEmpty(),
+            )
+        }.filter { it.markdown.isNotBlank() }
+        return ChatArchive.write(backup, documents)
+    }
+
+    /** 完整的备份模型（JSON 导出与 ZIP 归档共用）。 */
+    private suspend fun fullBackup(): BackupFile {
+        val messageByConversation = messages.getAllRaw().groupBy { it.conversationId }
+        val presetByConversation = conversationPresets.getAllRaw()
+            .groupBy { it.conversationId }
+
+        return BackupFile(
+            exportedAt = System.currentTimeMillis(),
+            conversations = conversations.getAllRaw().map { row ->
+                row.toBackup(
+                    messages = messageByConversation[row.id].orEmpty().withInlineAttachments(),
+                    presetIds = presetByConversation[row.id]
+                        .orEmpty()
+                        .sortedBy { it.sortOrder }
+                        .map { it.presetId },
+                )
+            },
+            presets = presets.getAll().map { it.toBackup() },
+        )
+    }
+
+    /**
+     * 导出**单个会话**。
+     *
+     * 复用完整备份的格式 —— 这样导出的文件仍能被「导入所有数据」读回去，
+     * 不必再维护第二套解析逻辑。
+     */
+    suspend fun exportConversation(conversationId: String): String? {
+        val row = conversations.findById(conversationId) ?: return null
+        val file = BackupFile(
+            exportedAt = System.currentTimeMillis(),
+            conversations = listOf(
+                row.toBackup(
+                    messages = messages.getAllFor(conversationId).withInlineAttachments(),
+                    presetIds = conversationPresets.getFor(conversationId)
+                        .sortedBy { it.sortOrder }
+                        .map { it.presetId },
+                ),
+            ),
+            // 单会话导出**不带全局预设** —— 导入方的预设库里未必有这些 id，
+            // 带过去只会制造一堆孤儿项
+            presets = emptyList(),
+        )
+        return backupJson.encodeToString(file)
+    }
+
+    /**
+     * 把当前对话导出为 **Markdown 文稿**。
+     *
+     * 与 [exportConversation]（JSON 备份）是两回事，**服务的是两种人**：
+     *
+     * | | JSON 备份 | Markdown 文稿 |
+     * |---|---|---|
+     * | 给谁看 | 机器 | 人 |
+     * | 内容 | 全部分支、全部版本、时间戳、性能数据 | 当前分支当前选中版本的正文 |
+     * | 用途 | 导入回来一模一样 | 贴进任何编辑器继续写 |
+     *
+     * 因此这里**刻意不做**三件事：不带分支版本、不带思考内容、不带性能数据 ——
+     * 对着一份稿子，那些都是噪音。
+     */
+    suspend fun exportConversationMarkdown(conversationId: String): String? {
+        val conversation = conversations.findById(conversationId) ?: return null
+        val path = loadActivePath(conversationId)
+        if (path.isEmpty()) return null
+
+        val exportedAt = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
+            .format(Date(System.currentTimeMillis()))
+
+        return buildString {
+            appendLine("# ${conversation.title}")
+            appendLine()
+            // 头部两行的文案随界面语言（`export_meta` / `export_scope_note`）
+            appendLine(
+                "> ${conversation.model.ifBlank { Res.get(R.string.export_unknown_model) }} · " +
+                    Res.get(R.string.export_meta, path.size, exportedAt),
+            )
+            appendLine("> ${Res.get(R.string.export_scope_note)}")
+            path.forEach { message ->
+                appendLine()
+                appendLine("---")
+                appendLine()
+                appendLine("**${Res.get(if (message.role == MessageRole.USER) R.string.export_role_me else R.string.export_role_ai)}**")
+                appendLine()
+                if (message.content.isNotBlank()) {
+                    appendLine(message.content.trim())
+                }
+                /*
+                 * 附件也带出来。
+                 *
+                 * 图片**只留一行占位**，不内嵌 base64 —— 一张图就是几十万字符的
+                 * data URL，插进 .md 里这份文稿就没法读了。需要连图片一起带走的
+                 * 场合用 JSON 备份（那是给机器的格式，图片原样在里面）。
+                 */
+                message.attachments.forEach { attachment ->
+                    appendLine()
+                    if (attachment.kind == Attachment.Kind.IMAGE) {
+                        appendLine(
+                            "> ${Res.get(
+                                R.string.export_image_attachment,
+                                attachment.name,
+                                attachment.width,
+                                attachment.height,
+                            )}",
+                        )
+                    } else {
+                        appendLine("**${Res.get(R.string.export_attachment, attachment.name)}**")
+                        appendLine()
+                        appendLine("```")
+                        appendLine(attachment.data.trimEnd())
+                        appendLine("```")
+                    }
+                }
+            }
+            appendLine()
+            appendLine("---")
+        }
+    }
+
+    /**
+     * 从 JSON 文本导入。
+     *
+     * - [ImportMode.MERGE]：按 `id` 去重，已存在的一律跳过。多设备汇总时不会覆盖本地改动。
+     * - [ImportMode.OVERWRITE]：先清空本机会话再导入，等价于「换机恢复」。
+     *
+     * 预设**两种模式都不删本地已有项**，只按 id 覆盖 —— 预设是用户长期积累的资产，
+     * 不该因为恢复一份旧备份就被清掉。
+     */
+    suspend fun importBackup(text: String, mode: ImportMode): ImportReport =
+        importParsed(backupJson.decodeFromString<BackupFile>(text).also {
+            if (it.format != BackupFile.FORMAT) {
+                throw AppTextException(R.string.err_not_our_backup, it.format)
+            }
+        }, mode)
+
+    /**
+     * 从**任意**备份文件导入：认得本应用的 JSON，也认得 Chatbox 的 ZIP / JSON。
+     *
+     * 识别与翻译交给 `ExternalBackup`（它只做"怎么读"），
+     * 落库复用下面这段（它只管"怎么写"）—— 两条路径共用一套写入逻辑，
+     * 就不会出现"从 A 导入加了新字段、从 B 导入忘了加"这种分叉。
+     *
+     * @param scratchDir ZIP 形态要落临时文件才能读（见 `ExternalBackup.parseZip`），传 `cacheDir`。
+     */
+    suspend fun importExternal(
+        bytes: ByteArray,
+        scratchDir: File,
+        mode: ImportMode,
+    ): Pair<ImportReport, String> = importExternal(ExternalBackup.parse(bytes, scratchDir), mode)
+
+    /**
+     * 从**磁盘上的文件**导入 —— 大文件（几百 MB 的 DeepSeek 导出）必须走这条。
+     *
+     * 整包读进 `ByteArray` 会 OOM 或长时间无响应，而 `ZipFile` 只需要文件本身。
+     * 调用方负责在导入结束后删掉临时文件。
+     */
+    suspend fun importExternal(
+        file: File,
+        scratchDir: File,
+        mode: ImportMode,
+        onProgress: (Float) -> Unit = {},
+    ): Pair<ImportReport, String> = try {
+        importExternalFile(file, scratchDir, mode, onProgress)
+    } catch (error: AppTextException) {
+        throw error
+    } catch (error: java.util.zip.ZipException) {
+        // 包体损坏（CRC / 结构错）。给用户一句能行动的话，而不是 `Invalid CEN header`
+        throw AppTextException(R.string.err_archive_damaged)
+    } catch (error: java.io.EOFException) {
+        // 典型是 `Unexpected end of ZLIB input stream`：文件被截断（下载中断/空间不足）
+        throw AppTextException(R.string.err_archive_damaged)
+    }
+
+    private suspend fun importExternalFile(
+        file: File,
+        scratchDir: File,
+        mode: ImportMode,
+        onProgress: (Float) -> Unit,
+    ): Pair<ImportReport, String> {
+        /*
+         * DeepSeek 导出先走**流式**导入：它的会话数量级最大（一份归档几千个会话、
+         * 两万多条消息），整包建对象会 OOM。判定只看 `manifest.json` 一个字段，
+         * 代价是开一次 ZIP —— 与"导入过程中内存爆掉"相比不值一提。
+         */
+        val isDeepSeek = runCatching {
+            ZipFile(file).use { zip -> DeepSeekHistory.detect(zip) }
+        }.getOrDefault(false)
+        if (isDeepSeek) {
+            val failures = mutableListOf<ImportFailure>()
+            var droppedImages = 0
+            val report = ZipFile(file).use { zip ->
+                val opened = DeepSeekHistory.open(
+                    zip = zip,
+                    naming = importNaming(),
+                    onProgress = onProgress,
+                    onFailure = { failure ->
+                        // 用户看不到日志，但出问题时要能查：谁被跳过、为什么
+                        failures += failure
+                        android.util.Log.w(ImportLogTag, "跳过会话 ${failure.reference}：${failure.reason}")
+                    },
+                    onImageDropped = { droppedImages++ },
+                ) ?: throw AppTextException(R.string.err_unrecognised_file)
+                // 序列必须在 ZIP 关掉之前消费完，所以写库也在 use 里执行
+                importStream(
+                    conversationsSeq = opened,
+                    presetsToWrite = emptyList(),
+                    mode = mode,
+                    expected = opened.expected,
+                    failures = failures.toList(),
+                    droppedImages = droppedImages,
+                )
+            }
+            if (report.conversations == 0 && report.alreadyPresent == 0) {
+                // 一条都没进来、但有会话被记了失败 → 不是"文件认不出来"，是"文件读不出来"
+                throw if (report.failed > 0) {
+                    AppTextException(R.string.err_archive_damaged)
+                } else {
+                    AppTextException(R.string.err_no_sessions)
+                }
+            }
+            return report to importSummary(
+                sourceName = Res.get(R.string.backup_source_deepseek),
+                report = report,
+                warnings = listOf(AppText.of(R.string.warn_deepseek_limited)),
+            )
+        }
+
+        return importExternal(
+            ExternalBackup.parse(file, scratchDir, naming = importNaming(), onProgress = onProgress),
+            mode,
+        )
+    }
+
+    /**
+     * 导入时图片**落盘**：字节进 `filesDir/attachments/`，行里只留文件名。
+     *
+     * 内联会让"附件 + 正文"那一行超过 `CursorWindow` 的 2MB，整条会话读不出来；
+     * 落盘之后导入侧的图片配额才能全部取消（见 `AttachmentFiles`）。
+     */
+    private fun importNaming() = ExternalBackup.ImportNaming(
+        storeImage = { bytes, mime -> AttachmentFiles.save(context, bytes, mime) },
+    )
+
+    /** 把落盘附件的字节读回内存，供构造请求 / 导出备份使用（都在 IO 上做）。 */
+    internal suspend fun materialize(attachments: List<Attachment>): List<Attachment> =
+        if (attachments.none { it.isStored }) attachments
+        else withContext(Dispatchers.IO) { AttachmentFiles.materialize(context, attachments) }
+
+    /**
+     * 构造请求前整理附件：**字节读回内存 + 图片按真实内容校正**。
+     *
+     * 两件事合成一个入口，是因为它们在请求链路上本来就是同一步：
+     * 读字节 → 判格式 → 必要时转码 → 回 base64。为什么要按内容判断、为什么要转码，
+     * 见 [ApiImage]：历史里的图片可能是服务端不认的格式，而**每一轮都会重发**，
+     * 一张坏图能让整个会话永远发不出去。
+     *
+     * @return 可内联的附件 + 被丢掉的图片张数（损坏或解不开）。宁可少一张图，
+     *   也不能让整轮请求 400 —— 丢弃数量由调用方如实告诉用户。
+     */
+    internal suspend fun prepareRequestAttachments(
+        attachments: List<Attachment>,
+    ): Pair<List<Attachment>, Int> {
+        if (attachments.isEmpty()) return attachments to 0
+        return withContext(Dispatchers.IO) {
+            var dropped = 0
+            val prepared = attachments.mapNotNull { attachment ->
+                if (!attachment.isImage) return@mapNotNull attachment
+                val bytes = if (attachment.isStored) {
+                    AttachmentFiles.read(context, attachment.path)
+                } else {
+                    runCatching { Base64.decode(attachment.data, Base64.NO_WRAP) }.getOrNull()
+                }
+                val image = bytes?.let { ApiImage.prepare(it) }
+                if (image == null) {
+                    dropped++
+                    null
+                } else {
+                    attachment.copy(mime = image.mediaType, data = image.base64, path = null)
+                }
+            }
+            prepared to dropped
+        }
+    }
+
+    /**
+     * 导出的前置处理：把落盘附件的字节读回 base64。
+     *
+     * 备份格式没变（图片仍是内联 base64），所以"导入 → 导出 → 再导入"这条链路
+     * 与原来自洽；区别只在**运行期**的存储位置。
+     */
+    private suspend fun List<MessageEntity>.withInlineAttachments(): List<MessageEntity> =
+        if (none { Attachments.decode(it.attachments).any { a -> a.isStored } }) {
+            this
+        } else withContext(Dispatchers.IO) {
+            map { message ->
+                val attachments = Attachments.decode(message.attachments)
+                if (attachments.none { it.isStored }) message
+                else message.copy(
+                    attachments = Attachments.encode(AttachmentFiles.materialize(context, attachments)),
+                )
+            }
+        }
+
+    private suspend fun importExternal(
+        parsed: ExternalBackup.Parsed,
+        mode: ImportMode,
+    ): Pair<ImportReport, String> {
+        val report = importStream(
+            conversationsSeq = parsed.file.conversations.asSequence(),
+            presetsToWrite = parsed.file.presets,
+            mode = mode,
+            expected = parsed.expected,
+            failures = parsed.failures,
+            droppedImages = parsed.droppedImages,
+        )
+        return report to importSummary(
+            sourceName = Res.get(parsed.source.nameRes),
+            report = report,
+            warnings = parsed.warnings,
+        )
+    }
+
+    /**
+     * 从解析好的备份模型落库。
+     *
+     * - [ImportMode.MERGE]：按 `id` 去重，已存在的一律跳过。多设备汇总时不会覆盖本地改动。
+     * - [ImportMode.REPLACE_SAME]：同名先删再导。
+     *
+     * 预设**各模式都不删本地已有项**，只按 id 覆盖 —— 预设是用户长期积累的资产，
+     * 不该因为恢复一份旧备份就被清掉。
+     */
+    suspend fun importParsed(file: BackupFile, mode: ImportMode): ImportReport =
+        importStream(file.conversations.asSequence(), file.presets, mode, expected = file.conversations.size)
+
+    /**
+     * **流式**导入：逐批取会话、逐批写库。
+     *
+     * 为什么不能"先建好整个 `BackupFile` 再写"：那个模型的峰值内存 = 全部会话 +
+     * 全部图片 base64 之和。实测 2106 个会话 / 24535 条消息的 DeepSeek 归档解压后
+     * 是几百兆，堆里放不下 —— 报错形如
+     * `Failed to allocate a 893424 byte allocation with 424432 free bytes`。
+     * 改成流式 + 分批事务之后，峰值只与"单条最大的会话"有关，与归档总量无关。
+     *
+     * ### 写库的底线：一条坏数据不许毁掉整次导入
+     *
+     * 一批 50 条共用**一个事务**（快）。但只要有一条写不进去，整个事务回滚 ——
+     * 前面的 49 条也跟着没了，而用户看到的只是"导入失败"。所以这里在整批失败时
+     * **退化成逐条重试**：坏的那条被隔离、记进 [ImportReport.failures]，其余照常入库。
+     * 正常路径没有额外开销（一次事务），只有真出问题时才多花一点时间。
+     */
+    private suspend fun importStream(
+        conversationsSeq: Sequence<BackupConversation>,
+        presetsToWrite: List<BackupPreset>,
+        mode: ImportMode,
+        expected: Int? = null,
+        failures: List<ImportFailure> = emptyList(),
+        droppedImages: Int = 0,
+    ): ImportReport {
+        var alreadyPresent = 0
+        var importedMessages = 0
+        var importedConversations = 0
+        val writeFailures = mutableListOf<ImportFailure>()
+
+        /*
+         * 同名判定要反复用（每个会话一次），先取一份标题快照。
+         *
+         * 它同时充当"本次导入已经占用的标题"：同一份备份里出现两个同名会话时，
+         * 第二个也能拿到不同的副本名，不会两条都叫「副本」。
+         */
+        val titles = mutableSetOf<String>()
+        db.withTransaction { titles += conversations.allTitles() }
+
+        fun count(outcome: Pair<Boolean, Int>) {
+            val (wasSkipped, messagesWritten) = outcome
+            if (wasSkipped) alreadyPresent++ else {
+                importedConversations++
+                importedMessages += messagesWritten
+            }
+        }
+
+        val batch = ArrayList<BackupConversation>(ImportBatchSize)
+        suspend fun flush() {
+            if (batch.isEmpty()) return
+            val items = ArrayList(batch)
+            batch.clear()
+
+            // 先整批一个事务（快路径）；计数放在事务**提交之后**，回滚时不会多算
+            val titlesBeforeBatch = LinkedHashSet(titles)
+            val batchOutcome = runCatching {
+                db.withTransaction { items.map { item -> item to writeConversation(item, mode, titles) } }
+            }
+            val outcomes = batchOutcome.getOrNull()
+            if (outcomes != null) {
+                outcomes.forEach { (_, outcome) -> count(outcome) }
+                return
+            }
+
+            /*
+             * 整批回滚了：逐条重试，把坏的那条隔离出来。
+             *
+             * 必须先把 `titles` 恢复成整批之前的样子 —— 回滚的只是数据库，
+             * 内存里那个集合已经被改过了，留着会让后面的同名判定出错。
+             */
+            android.util.Log.w(ImportLogTag, "一批 ${items.size} 条写入失败，改为逐条重试", batchOutcome.exceptionOrNull())
+            titles.clear()
+            titles += titlesBeforeBatch
+            for (item in items) {
+                val before = LinkedHashSet(titles)
+                val outcome = runCatching {
+                    db.withTransaction { writeConversation(item, mode, titles) }
+                }
+                if (outcome.isSuccess) {
+                    count(outcome.getOrThrow())
+                } else {
+                    titles.clear()
+                    titles += before
+                    writeFailures += ImportFailure(
+                        title = item.title,
+                        reference = item.id,
+                        reason = ImportFailure.Reason.WRITE_FAILED,
+                    )
+                    android.util.Log.w(ImportLogTag, "会话写入失败，已隔离：${item.title}", outcome.exceptionOrNull())
+                }
+            }
+        }
+
+        for (conversation in conversationsSeq) {
+            batch += conversation
+            if (batch.size >= ImportBatchSize) flush()
+        }
+        flush()
+
+        if (presetsToWrite.isNotEmpty()) {
+            db.withTransaction {
+                for (preset in presetsToWrite) {
+                    presets.upsert(
+                        PresetEntity(
+                            id = preset.id,
+                            name = preset.name,
+                            content = preset.content,
+                            sortOrder = preset.sortOrder,
+                            createdAt = preset.createdAt,
+                            updatedAt = preset.updatedAt.takeIf { it > 0L } ?: preset.createdAt,
+                        ),
+                    )
+                }
+            }
+        }
+
+        return ImportReport(
+            conversations = importedConversations,
+            messages = importedMessages,
+            presets = presetsToWrite.size,
+            alreadyPresent = alreadyPresent,
+            expected = expected,
+            failures = failures + writeFailures,
+            droppedImages = droppedImages,
+        )
+    }
+
+    /**
+     * 把 [ImportReport] 拼成一句**能对账**的话。
+     *
+     * 结果页是用户判断"迁移成没成"的唯一依据，所以这里按"声明 → 结果 → 差额 → 原因"
+     * 的顺序说完整：会话 4 个（归档共 5 个）· 1 个未能导入：会话文件损坏 ×1。
+     * 宁可句子长一点，也不要一句"导入完成"然后少一条。
+     */
+    private fun importSummary(
+        sourceName: String,
+        report: ImportReport,
+        warnings: List<AppText>,
+    ): String = buildString {
+        append(Res.get(R.string.import_done, sourceName, report.conversations, report.messages))
+        report.expected?.let { expected ->
+            if (expected != report.conversations + report.alreadyPresent) {
+                append(Res.get(R.string.import_done_expected, expected))
+            }
+        }
+        if (report.alreadyPresent > 0) {
+            append(Res.get(R.string.import_done_duplicates, report.alreadyPresent))
+        }
+        if (report.failures.isNotEmpty()) {
+            append(
+                Res.get(
+                    R.string.import_done_failed,
+                    report.failures.size,
+                    failureReasons(report.failures),
+                ),
+            )
+            /*
+             * 能说出**是哪一条**就尽量说：DeepSeek 归档的索引里有标题，
+             * 用户看到"《夏萧因重逢对话》没能导入"才知道该重建哪一个，
+             * 一个光秃秃的"1 个未能导入"帮不上忙。最多列 3 个，再多就把提示撑成一段日志了。
+             */
+            val titles = report.failures
+                .mapNotNull { failure -> failure.title?.trim()?.takeIf { it.isNotEmpty() } }
+                .distinct()
+                .take(MaxFailedTitlesInSummary)
+            if (titles.isNotEmpty()) {
+                append(
+                    Res.get(
+                        R.string.import_failed_titles,
+                        titles.joinToString(Res.get(R.string.list_separator)),
+                    ),
+                )
+            }
+        }
+        if (report.droppedImages > 0) {
+            append(Res.get(R.string.import_note_separator))
+            append(Res.get(R.string.warn_dropped_images, report.droppedImages))
+        }
+        if (warnings.isNotEmpty()) {
+            append(Res.get(R.string.import_note_separator))
+            append(warnings.joinToString(Res.get(R.string.list_separator)) { it.resolve() })
+        }
+    }
+
+    /** 失败原因按"一句话 × 条数"归并：`会话文件损坏 ×3、会话文件过大 ×1`。 */
+    private fun failureReasons(failures: List<ImportFailure>): String =
+        failures.groupingBy { it.reason }.eachCount()
+            .entries
+            .sortedBy { it.key.ordinal }
+            .joinToString(Res.get(R.string.list_separator)) { (reason, count) ->
+                Res.get(R.string.import_fail_item, Res.get(reason.labelRes()), count)
+            }
+
+    /**
+     * 写**一条**会话（含它的消息与预设挂载）。返回 `(是否被跳过, 写入的消息数)`。
+     *
+     * 三种策略的判定都在这里，调用方（[importStream]）只负责分批与计数。
+     */
+    private suspend fun writeConversation(
+        raw: BackupConversation,
+        mode: ImportMode,
+        titles: MutableSet<String>,
+    ): Pair<Boolean, Int> {
+        var conversation = raw
+
+        when (mode) {
+            ImportMode.MERGE -> {
+                // 增量：按 id 去重。已存在就跳过，本地改动一律不动
+                if (conversations.findExistingId(conversation.id) != null) return true to 0
+            }
+
+            ImportMode.REPLACE_SAME -> {
+                // 同名 = 同一条会话：先删旧的（消息 / 预设挂载 / 摘要靠外键级联）
+                val clash = conversations.findIdByTitle(conversation.title)
+                    ?: conversations.findExistingId(conversation.id)
+                if (clash != null) {
+                    deleteConversationRecords(clash)
+                    titles.remove(conversation.title)
+                }
+            }
+
+            ImportMode.RENAME -> {
+                // 标题或 id 撞了就改名 + 换 id：一条都不能覆盖，两条并存
+                val clash = conversation.title in titles ||
+                    conversations.findExistingId(conversation.id) != null
+                if (clash) {
+                    val title = uniqueCopyTitle(
+                        title = conversation.title,
+                        taken = titles,
+                        suffix = Res.get(R.string.conversation_fork_suffix),
+                        suffixN = { n -> Res.get(R.string.conversation_fork_suffix_n, n) },
+                    )
+                    conversation = conversation
+                        .copy(title = title)
+                        .withFreshIds("${conversation.id}~${System.currentTimeMillis()}")
+                }
+            }
+        }
+
+        titles += conversation.title
+        conversations.upsert(
+            ConversationEntity(
+                id = conversation.id,
+                title = conversation.title,
+                mode = conversation.mode,
+                provider = conversation.provider,
+                model = conversation.model,
+                systemPrompt = conversation.systemPrompt,
+                createdAt = conversation.createdAt,
+                updatedAt = conversation.updatedAt,
+                pinned = conversation.pinned,
+                pinnedAt = conversation.pinnedAt,
+            ),
+        )
+
+        var written = 0
+        for (message in conversation.messages) {
+            // 消息主键是全局的：已存在就跳过（增量的常规情形；换 id 后不会撞）
+            if (messages.findExistingId(message.id) != null) continue
+            messages.upsert(message.toEntity(conversation.id).withOffloadedImages())
+            written++
+        }
+
+        // 恢复挂载的预设（顺序有意义：拼接顺序会影响模型对主次的判断）
+        writePresetLinks(conversation.id, conversation.enabledPresetIds)
+
+        /*
+         * 登记落盘图片的引用。
+         *
+         * 只记 path（几十字节），删除会话时据此删文件 —— 避开 messages.attachments
+         * 那一列的大 JSON（读它会撞 CursorWindow）。
+         */
+        val refs = conversation.messages
+            .flatMap { message -> message.attachments.mapNotNull { it.path } }
+            .distinct()
+            .map { path -> AttachmentRefEntity(path = path, conversationId = conversation.id) }
+        if (refs.isNotEmpty()) attachmentRefs.upsertAll(refs)
+
+        return false to written
+    }
+    /**
+     * 删掉一条会话及其附属记录 —— 「覆盖同名」用。
+     *
+     * 消息 / 预设挂载 / 压缩摘要有外键级联，会跟着走；**草稿不会**，
+     * 所以要手动清：留着就是一条指向已不存在会话的死数据。
+     */
+    private suspend fun deleteConversationRecords(id: String) {
+        conversations.delete(id)
+        drafts.clearAll(listOf(id))
+    }
+
+    private companion object {
+        /**
+         * 内置预设。刻意只做「一段提示词」，不做结构化角色卡（§9.1.1①）。
+         *
+         * ⚠️ 这里的文案是**会被 reconcileBuiltInPresets 同步到库里**的：改完下次启动生效，
+         * 不用清数据；但用户在界面上改过的预设不会被覆盖（见那个函数的规则）。
+         *
+         * 是**函数**而不是 val：文案随界面语言取（`preset_*`），换语言后
+         * 下次启动就会把没改过的内置预设同步成新语言 —— 这正是想要的行为。
+         */
+        fun builtInPresets(): List<Preset> = listOf(
+            Preset(
+                id = "novel",
+                name = Res.get(R.string.preset_novel_name),
+                content = Res.get(R.string.preset_novel_body),
+            ),
+            Preset(
+                id = "essay",
+                name = Res.get(R.string.preset_prose_name),
+                content = Res.get(R.string.preset_prose_body),
+            ),
+            Preset(
+                id = "poem",
+                name = Res.get(R.string.preset_poem_name),
+                content = Res.get(R.string.preset_poem_body),
+            ),
+        )
+
+        /**
+         * 上一代内置预设的 id。
+         *
+         * 没被用户改过的会顺手删掉（免得预设列表里留着一批用不上的条目）；
+         * 改过的留着不动 —— 那是用户的东西。
+         */
+        val retiredPresetIds = listOf("third-person", "slow-pace", "role-a")
+    }
+}
+
+
+
+/** 供 DAO 之外使用：把实体列表转成 UI 模型。 */
+fun List<MessageEntity>.toUiMessages(): List<UiMessage> = map { it.toUi() }
+
+/**
+ * 流式导入每批写多少条会话。
+ *
+ * 太小则事务开销高（每条会话一次 fsync），太大又回到占内存 —— 一批里带着
+ * 各会话的图片 base64，所以取 50 而不是 100。
+ */
+private const val ImportBatchSize = 50
+
+/**
+ * 导入链路的日志 tag。
+ *
+ * 用户看不到日志，但"哪条会话被跳过 / 为什么"必须留痕 —— 否则用户说
+ * "少了两个对话"时，我们只能猜。
+ */
+private const val ImportLogTag = "SimpleChat/Import"
+
+/** 导入结果里最多列出几个失败会话的标题（再多就把提示撑成一段日志了）。 */
+private const val MaxFailedTitlesInSummary = 3
+
+/** 附件列的截断长度：40 万字符 ≈ 300KB 图，远小于 2MB 的 CursorWindow。 */
+private const val CappedAttachmentsChars = 400_000
