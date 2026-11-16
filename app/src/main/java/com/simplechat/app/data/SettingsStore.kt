@@ -188,9 +188,10 @@ class SettingsStore(private val context: Context) {
             davAutoSync = prefs[Keys.DAV_AUTO_SYNC] ?: StoredSettings().davAutoSync,
             davLastSyncAt = prefs[Keys.DAV_LAST_SYNC] ?: StoredSettings().davLastSyncAt,
         )
-        // Keystore 解密要过 Binder：放到 IO 上，别在 Compose 的组合线程里做
-        .flowOn(Dispatchers.IO)
     }
+        // Keystore 解密要过 Binder：放到 IO 上，别在 Compose 的组合线程里做。
+        // ⚠️ 必须在 `map { }` **外面** —— 写进 lambda 里就成了对 StoredSettings 调 flowOn。
+        .flowOn(Dispatchers.IO)
 
     suspend fun setProvider(providerId: String, baseUrl: String, modelId: String) {
         context.settingsDataStore.edit { prefs ->

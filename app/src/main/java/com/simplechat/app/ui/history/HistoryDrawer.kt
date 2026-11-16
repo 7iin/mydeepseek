@@ -538,7 +538,7 @@ private fun HistoryGroup.label(): String = when (this) {
  * （"November 2026"）—— 数字格式在英语里是 `11/2026`，容易被当成日期。
  */
 private fun monthLabel(year: Int, month: Int): String =
-    if (Res.bool(R.bools.ui_is_cjk)) {
+    if (Res.bool(R.bool.ui_is_cjk)) {
         Res.get(R.string.hist_month_format, year, month)
     } else {
         val name = java.time.Month.of(month)
