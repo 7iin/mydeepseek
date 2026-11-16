@@ -1269,7 +1269,18 @@ private fun SyncPage(
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         if (state.running) {
-            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            /*
+             * 有总数就给**确定进度**（几百个会话要传好几分钟，光转圈让人以为卡死），
+             * 没有总数（下载 meta、列目录那种瞬间动作）才转圈。
+             */
+            if (state.total > 0) {
+                LinearProgressIndicator(
+                    modifier = Modifier.fillMaxWidth(),
+                    progress = { (state.done.toFloat() / state.total).coerceIn(0f, 1f) },
+                )
+            } else {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
         }
 
         /*
@@ -1281,8 +1292,18 @@ private fun SyncPage(
         val status = when {
             state.running -> when (state.stage) {
                 SyncStage.DOWNLOAD -> stringResource(R.string.sync_stage_download)
-                SyncStage.MERGE -> stringResource(R.string.sync_stage_merge)
-                SyncStage.UPLOAD -> stringResource(R.string.sync_stage_upload)
+                SyncStage.MERGE -> if (state.total > 0) {
+                    stringResource(R.string.sync_progress_pull, state.done, state.total)
+                } else {
+                    stringResource(R.string.sync_stage_merge)
+                }
+
+                SyncStage.UPLOAD -> if (state.total > 0) {
+                    stringResource(R.string.sync_progress_upload, state.done, state.total)
+                } else {
+                    stringResource(R.string.sync_stage_upload)
+                }
+
                 null -> stringResource(R.string.sync_now)
             }
 

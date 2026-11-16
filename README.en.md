@@ -4,7 +4,7 @@
 
 **[中文](README.md) | English**
 
-![Version](https://img.shields.io/badge/version-1.2.1-blue)
+![Version](https://img.shields.io/badge/version-1.2.2-blue)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ## What this is
@@ -17,7 +17,7 @@ targeted changes and a few real bug fixes (see [CODE_REVIEW.md](CODE_REVIEW.md))
 |---|---|
 | **Images above the bubble** | Sent images render as fixed 104dp square previews **above** the message bubble (up to three per row, `Crop`), tap to view full screen, long-press for the message menu. Image-only messages no longer draw an empty bubble. |
 | **History grouped by month** | The drawer goes from Today / Yesterday / Past 7 days / Earlier to **Pinned + one group per month** (`November 2026`). The old buckets ended up stuffing ~90% of a long history into "Earlier". |
-| **WebDAV sync (streaming)** | Settings → Cloud sync. The payload is **line-delimited JSON** (one chat per line) and images are uploaded separately under `media/` keyed by content hash — nothing ever loads the whole library into memory. Merging is per conversation by `updatedAt` (last-write-wins). Optional sync on launch, manual sync, connection test. |
+| **WebDAV sync (incremental)** | Settings → Cloud sync. The remote side is **one file per chat** plus images keyed by content hash: only changed chats are uploaded, each PUT is a few tens of KB, and an interrupted sync resumes where it stopped. Peak memory tracks the largest single chat. Merging is per conversation by `updatedAt` (last-write-wins). Optional sync on launch, manual sync, connection test. |
 | **Fix: sent images were never written to disk** | Picked photos were inlined as base64 into `messages.attachments`; one 3 MB photo made a 4 MB row, past Android's 2 MB `CursorWindow` limit, so that conversation became unreadable and the image was silently dropped by the fallback path. Now the send path offloads like the import path always did. |
 | **Fix: deleting a message leaked image files** | Files exclusively owned by deleted messages (and their refs) are now reclaimed. |
 | **Fix: Keystore decryption on the main thread** | The settings flow now reads on IO. |
@@ -101,8 +101,9 @@ On the drive:
 
 ```
 myDeepSeek/
-├─ sync.jsonl   line 1 = header (format/version/presets), then one chat per line
-└─ media/       images named by content hash (first 32 chars of sha256)
+├─ meta.json                   format / version / presets (tiny)
+├─ conv/<id>.<updatedAt>.json  one file per chat, the file name carries the version
+└─ media/<sha256>.jpg          images, content-addressed
 ```
 
 **Images are not base64 in the JSON.** A 3 MB photo becomes 4 MB of base64, which made a single
@@ -110,9 +111,13 @@ line megabytes long and forced whole-file reads — that was the OOM. Now the JS
 file name; the bytes travel as their own file, and because the name is the content hash, "same name"
 means "same content" (free dedup).
 
-How it works: stream the remote `sync.jsonl` to a cache file → parse it **line by line**, keeping
-only chats whose `updatedAt` is newer → fetch missing images → delete superseded local chats (drafts
-are preserved) → stream them back in. Then the same in reverse for upload. Peak memory tracks the
+One file per chat, with `updatedAt` in the name, buys three things: a single PUT stays small (no more
+mid-transfer 503s), **unchanged chats are never re-sent** (a directory listing tells us what the remote
+already has), and an interrupted sync simply resumes next time.
+
+How it works: `GET meta.json` + `PROPFIND conv/` → download only chats newer than local (delete the
+superseded local copy, keep drafts, import) → upload only chats the remote doesn't have this version
+of, images first → write `meta.json` last and drop the superseded remote files. Peak memory tracks the
 **largest single chat**, not the library size.
 
 Known limits:

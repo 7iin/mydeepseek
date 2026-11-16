@@ -136,6 +136,53 @@ class WebDavClient(
     }
 
     /**
+     * 列出一个目录下的**文件名**（`PROPFIND` + `Depth: 1`）。
+     *
+     * 同步靠它来算"远端有哪些会话、各自是哪一版"，因此不需要任何清单文件 ——
+     * 目录本身就是清单。目录不存在（第一次同步）返回空列表。
+     *
+     * 只取文件名：`href` 是 URL 编码过的，且各服务端的命名空间前缀写法不一
+     * （`d:href` / `D:href` / `href`），所以用宽松匹配而不是严格的 XML 解析 ——
+     * 我们只要最后一个路径段，不需要文档结构。
+     */
+    fun listNames(config: Config, remoteDir: String): List<String> {
+        val body = """
+            <?xml version="1.0" encoding="utf-8"?>
+            <d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>
+        """.trimIndent().toRequestBody(XmlMedia)
+
+        val request = authorized(config, targetUrl(config, remoteDir))
+            .method("PROPFIND", body)
+            .header("Depth", "1")
+            .build()
+
+        return call(request).use { response ->
+            when {
+                response.code == 404 -> emptyList()
+                !response.isSuccessful -> throw httpError(response)
+                else -> {
+                    val xml = response.body?.string().orEmpty()
+                    HrefRegex.findAll(xml)
+                        .mapNotNull { match -> match.groupValues[1].trim().ifEmpty { null } }
+                        .mapNotNull { href -> lastSegment(href) }
+                        .toList()
+                }
+            }
+        }
+    }
+
+    /** 删一个远端文件；本来就不在（404）也算成功。 */
+    fun delete(config: Config, remotePath: String) {
+        val request = authorized(config, targetUrl(config, remotePath)).delete().build()
+        call(request).use { response ->
+            when {
+                response.isSuccessful || response.code == 404 -> Unit
+                else -> throw httpError(response)
+            }
+        }
+    }
+
+    /**
      * 远端是否存在这个文件（`HEAD`）。
      *
      * 图片上传前先用它判一下 —— 内容寻址的名字不变就意味着内容没变，
@@ -201,6 +248,14 @@ class WebDavClient(
         return url
     }
 
+    /** `href` 的最后一个路径段（URL 解码后）；没有就用 null。 */
+    private fun lastSegment(href: String): String? {
+        val trimmed = href.trimEnd('/')
+        val last = trimmed.substringAfterLast('/')
+        if (last.isEmpty()) return null
+        return runCatching { java.net.URLDecoder.decode(last, "UTF-8") }.getOrDefault(last)
+    }
+
     private fun pathSegments(path: String): List<String> =
         path.split('/').map { it.trim() }.filter { it.isNotEmpty() }
 
@@ -220,6 +275,18 @@ class WebDavClient(
         private const val Buffer = 64 * 1024
 
         private const val UserAgent = "myDeepSeek-Android"
+
+        /**
+         * 匹配 `<d:href>` / `<D:href>` / `<href>`。
+         *
+         * 宽容是有意的：不同服务端的前缀、大小写、属性写法都不一样，而我们只关心
+         * 标签里的文本。真正的 XML 解析要么引一个库，要么写一堆命名空间处理 ——
+         * 就为了取个文件名，不值。
+         */
+        private val HrefRegex = Regex(
+            "<(?:[A-Za-z0-9]+:)?href[^>]*>([^<]+)</(?:[A-Za-z0-9]+:)?href>",
+            RegexOption.IGNORE_CASE,
+        )
 
         /** 同步文件本身用 JSON 的 MIME，便于网盘按类型识别/预览。 */
         val SyncPayloadMedia: MediaType = JsonMedia

@@ -43,10 +43,24 @@ internal fun readStoredLanguageSync(context: Context): AppLanguage = runCatching
  * 引用同类的 companion 成员在部分编译器版本上会报初始化顺序问题，
  * 顶层常量没有这个歧义。
  */
-const val DEFAULT_DAV_PATH = "myDeepSeek/sync.jsonl"
+const val DEFAULT_DAV_PATH = "myDeepSeek"
 
-/** 上一版的默认路径（大 JSON）。读设置时顺手换掉，免得上线后两个名字并存。 */
-private const val LegacyDavPath = "myDeepSeek/backup.json"
+/**
+ * 远程路径归一成**目录**。
+ *
+ * 同步在网盘上是一个目录（`meta.json` + `conv/` + `media/`），不是一个文件。
+ * 但上一版填的是文件路径（`myDeepSeek/sync.jsonl`）—— 这里自动取它的父目录，
+ * 老配置不用重填，也不会因为多了一层 `sync.jsonl/` 目录而错位。
+ */
+internal fun normalizeDavDir(raw: String?): String {
+    val trimmed = raw?.trim().orEmpty().trim('/')
+    if (trimmed.isBlank()) return DEFAULT_DAV_PATH
+    if (trimmed.endsWith(".json") || trimmed.endsWith(".jsonl")) {
+        val parent = trimmed.substringBeforeLast('/', missingDelimiterValue = "")
+        return parent.ifBlank { DEFAULT_DAV_PATH }
+    }
+    return trimmed
+}
 
 /** 持久化的全局配置。 */
 data class StoredSettings(
@@ -114,10 +128,10 @@ data class StoredSettings(
     /** 应用密码（坚果云的「第三方应用密码」），与 API Key 一样只存密文。 */
     val davPassword: String = "",
     /**
-     * 远程文件路径（相对服务器根）。
+     * 远程**目录**（相对服务器根），同步数据都放在这里面。
      *
      * 带一层目录而不是直接扔在根下：多数网盘的根目录是用户自己的文件区，
-     * 往里丢一个 `backup.json` 既容易撞名，也难看。
+     * 往里面丢一堆文件既容易撞名，也难看。
      */
     val davPath: String = DEFAULT_DAV_PATH,
     /** 打开应用时自动同步一次。默认关：网络与计费都该由用户决定。 */
@@ -187,8 +201,7 @@ class SettingsStore(private val context: Context) {
             davUrl = prefs[Keys.DAV_URL] ?: StoredSettings().davUrl,
             davUser = prefs[Keys.DAV_USER] ?: StoredSettings().davUser,
             davPassword = readDavPassword(prefs),
-            davPath = (prefs[Keys.DAV_PATH] ?: StoredSettings().davPath)
-                .let { if (it == LegacyDavPath) DEFAULT_DAV_PATH else it },
+            davPath = normalizeDavDir(prefs[Keys.DAV_PATH] ?: DEFAULT_DAV_PATH),
             davAutoSync = prefs[Keys.DAV_AUTO_SYNC] ?: StoredSettings().davAutoSync,
             davLastSyncAt = prefs[Keys.DAV_LAST_SYNC] ?: StoredSettings().davLastSyncAt,
         )
@@ -340,8 +353,7 @@ class SettingsStore(private val context: Context) {
 
     /** 远程文件路径：归一成 `a/b.json`（无前导斜杠），空值回落到默认。 */
     suspend fun setDavPath(path: String) {
-        val normalized = path.trim().trimStart('/').trimEnd('/').ifBlank { DEFAULT_DAV_PATH }
-        context.settingsDataStore.edit { it[Keys.DAV_PATH] = normalized }
+        context.settingsDataStore.edit { it[Keys.DAV_PATH] = normalizeDavDir(path) }
     }
 
     suspend fun setDavAutoSync(enabled: Boolean) {

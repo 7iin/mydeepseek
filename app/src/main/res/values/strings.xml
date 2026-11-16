@@ -524,7 +524,7 @@
     <string name="sync_account">账号</string>
     <string name="sync_password">应用密码</string>
     <string name="sync_password_unset">未设置</string>
-    <string name="sync_path">远程文件</string>
+    <string name="sync_path">远程目录</string>
     <string name="sync_now">立即同步</string>
     <string name="sync_now_summary">上传本地、拉取远端，按更新时间合并</string>
     <string name="sync_test">测试连接</string>
@@ -535,7 +535,7 @@
     <string name="sync_stage_download">正在下载云端备份…</string>
     <string name="sync_stage_merge">正在合并…</string>
     <string name="sync_stage_upload">正在上传…</string>
-    <string name="sync_done">同步完成：拉取 %1$d 个会话 · 上传 %2$d 张图片</string>
+    <string name="sync_done">同步完成：拉取 %1$d 个会话 · 上传 %2$d 个会话、%3$d 张图片</string>
     <string name="sync_test_ok">连接成功</string>
     <string name="sync_need_config">先填服务器地址、账号与应用密码</string>
     <string name="sync_err_url">服务器地址无效（需要 http:// 或 https://）</string>
@@ -549,6 +549,8 @@
     <string name="sync_err_network">网络错误：%1$s</string>
     <string name="sync_note_broken">（跳过 %1$d 行损坏数据）</string>
     <string name="sync_note_legacy">（云端的旧格式文件已被新格式替换）</string>
-    <string name="sync_hint">坚果云：地址填 https://dav.jianguoyun.com/dav/，密码用「第三方应用密码」。同步文件是逐行 JSON（一行一个会话），图片单独存在同目录的 media/ 下，所以会话再多也不会整份读进内存。</string>
+    <string name="sync_progress_pull">拉取 %1$d/%2$d</string>
+    <string name="sync_progress_upload">上传 %1$d/%2$d</string>
+    <string name="sync_hint">坚果云：地址填 https://dav.jianguoyun.com/dav/，密码用「第三方应用密码」。网盘上是一个目录：一个会话一个文件（只传变化过的）、图片按内容哈希单独存，单次上传很小，断了也能接着传。</string>
 </resources>
 

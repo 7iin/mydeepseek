@@ -524,7 +524,7 @@
     <string name="sync_account">Account</string>
     <string name="sync_password">App password</string>
     <string name="sync_password_unset">Not set</string>
-    <string name="sync_path">Remote file</string>
+    <string name="sync_path">Remote folder</string>
     <string name="sync_now">Sync now</string>
     <string name="sync_now_summary">Upload local, pull remote, merge by update time</string>
     <string name="sync_test">Test connection</string>
@@ -535,7 +535,7 @@
     <string name="sync_stage_download">Downloading the remote backup…</string>
     <string name="sync_stage_merge">Merging…</string>
     <string name="sync_stage_upload">Uploading…</string>
-    <string name="sync_done">Synced: pulled %1$d chats · uploaded %2$d images</string>
+    <string name="sync_done">Synced: pulled %1$d · uploaded %2$d chats, %3$d images</string>
     <string name="sync_test_ok">Connected</string>
     <string name="sync_need_config">Fill in the server URL, account and app password first</string>
     <string name="sync_err_url">Invalid server URL (http:// or https:// required)</string>
@@ -549,6 +549,8 @@
     <string name="sync_err_network">Network error: %1$s</string>
     <string name="sync_note_broken"> (skipped %1$d damaged lines)</string>
     <string name="sync_note_legacy"> (the old-format remote file was replaced)</string>
-    <string name="sync_hint">Nutstore: use https://dav.jianguoyun.com/dav/ with an app password. The sync file is line-delimited JSON (one chat per line) and images live under media/, so nothing loads the whole library at once.</string>
+    <string name="sync_progress_pull">Pulling %1$d/%2$d</string>
+    <string name="sync_progress_upload">Uploading %1$d/%2$d</string>
+    <string name="sync_hint">Nutstore: use https://dav.jianguoyun.com/dav/ with an app password. The remote side is a folder: one file per chat (only changed ones are uploaded) plus images keyed by content hash, so each request stays small and an interrupted sync resumes where it stopped.</string>
 </resources>
 

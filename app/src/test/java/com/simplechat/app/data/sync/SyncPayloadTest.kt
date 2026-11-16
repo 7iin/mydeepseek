@@ -144,6 +144,48 @@ class SyncPayloadTest {
         assertNull(SyncPayload.readHeader(File(file.parentFile, "does-not-exist.jsonl")))
     }
 
+    // ── 远端布局：一会话一文件 ──────────────────────────
+
+    @Test
+    fun `会话文件名带版本，能原样解析回来`() {
+        val id = "8f14e45f-ea6b-4b1e-9f0c-1d2a3b4c5d6e"
+        val name = SyncLayout.conversationName(id, 1_700_000_000_123L)
+
+        assertEquals("$id.1700000000123.json", name)
+        val parsed = SyncLayout.parseConversationName(name)
+        assertEquals(id, parsed?.id)
+        assertEquals(1_700_000_000_123L, parsed?.updatedAt)
+    }
+
+    @Test
+    fun `改一次时间戳就换一个名字，远端因此认得是新版本`() {
+        val id = "abc"
+        assertFalse(
+            SyncLayout.conversationName(id, 100L) == SyncLayout.conversationName(id, 101L),
+        )
+    }
+
+    @Test
+    fun `认不出的文件名一律忽略`() {
+        // 网盘里可能有 .DS_Store、缩略图、旧版本留下的 backup.json
+        assertNull(SyncLayout.parseConversationName(".DS_Store"))
+        assertNull(SyncLayout.parseConversationName("backup.json"))
+        assertNull(SyncLayout.parseConversationName("abc.notanumber.json"))
+        assertNull(SyncLayout.parseConversationName("abc.123.txt"))
+        // 带路径的不是文件名，不该被当成会话
+        assertNull(SyncLayout.parseConversationName("conv/abc.123.json"))
+    }
+
+    @Test
+    fun `路径拼装不会出现双斜杠`() {
+        assertEquals("myDeepSeek/meta.json", SyncLayout.metaPath("myDeepSeek"))
+        assertEquals("myDeepSeek/conv", SyncLayout.conversationDir("myDeepSeek"))
+        assertEquals(
+            "myDeepSeek/conv/a.1.json",
+            SyncLayout.conversationPath("myDeepSeek", "a.1.json"),
+        )
+    }
+
     // ── 冲突判定 ────────────────────────────────────────
 
     @Test

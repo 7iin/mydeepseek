@@ -43,37 +43,39 @@ data class SyncState(
      * 那条会话可能刚被远端版本整条换掉，内存里的消息树已经过期。
      */
     val pulled: Int = 0,
+    /** 当前阶段的进度（已处理 / 总数）。总数 0 表示没有可数的进度。 */
+    val done: Int = 0,
+    val total: Int = 0,
 )
 
 /**
- * WebDAV 同步（**流式**）。
+ * WebDAV 同步（**逐会话增量**）。
  *
- * ### 数据怎么走
+ * ### 网盘上是"一个会话一个文件"
  *
  * ```
- * 远端 sync.jsonl ──流式下载──> 临时文件 ──逐行解析──> 逐条比对/落库
- *                                                        │
- * 本地数据库 ──逐条取会话──> 临时文件 ──流式上传──> 远端 sync.jsonl
- *                                   └──图片单独上传──> 远端 media/<sha256>.jpg
+ * <远程目录>/
+ * ├─ meta.json                    预设与版本（很小）
+ * ├─ conv/<id>.<updatedAt>.json    会话，**文件名自带版本**
+ * └─ media/<sha256>.jpg            图片，内容寻址
  * ```
  *
- * 全程**没有任何一步把整个库读进内存**：
+ * 之前是"整库一个大文件"：历史一大，单次 PUT 就是几十上百兆，实测传到一半被
+ * 服务端 503 掐断，重试又从头再来。拆开之后每次 PUT 只有几十 KB，而且：
  *
- * - 载荷是 JSONL（一行一个会话），读写都是逐行的（见 [SyncPayload]）；
- * - 图片不进 JSON，按内容哈希单独上传，JSON 里只留文件名；
- * - 上传直接给 OkHttp 一个 `File`，它自己边读边发。
+ * - **只传变过的会话**：远端已有同名文件（id + updatedAt 都对得上）就跳过；
+ * - **断了能续**：已传上去的下次自动跳过；
+ * - **不需要清单**：`PROPFIND` 列一下 `conv/` 就是远端状态；
+ * - **内存有界**：一次只读/写/传一个会话。
  *
- * 峰值内存 ≈ **最大的一个会话** + 一张图片的字节，与库有多大无关。
- *
- * ### 冲突策略：**按会话 last-write-wins**
+ * ### 冲突策略：按会话 last-write-wins
  *
  * 以 `conversations.updatedAt` 为准：远端更新就覆盖本地这一条，本地更新就留着，
- * 最后把合并结果整份传回去。不做逐条消息的 diff —— 消息树（分支 / 多版本）
- * 一旦逐条合并，很容易拼出"父消息来自 A 设备、子消息来自 B 设备"的断链。
+ * 然后把本地这一版传上去（旧版本的远端文件顺手删掉）。
+ * 不做逐条消息 diff —— 消息树一旦逐条合并，很容易拼出跨设备的断链。
  *
- * 已知限制（见 README）：**删除不传播**。在 A 设备删掉的会话，会在 B 设备
- * 下次同步时被重新带回来，除非两台设备都删过。要做对得引入墓碑记录，
- * 那会给 messages 加一套"已删除但保留"的状态，对个人使用不划算。
+ * 已知限制（见 README）：**删除不传播**。A 设备删掉的会话，B 设备下次同步会把它
+ * 再传回网盘。
  */
 class SyncManager(
     private val context: Context,
@@ -95,6 +97,14 @@ class SyncManager(
      * 再互相覆盖着写回去，浪费流量还可能丢合并结果。
      */
     private val running = Mutex()
+
+    /**
+     * 本次运行里已经确认过（传过、或远端已有）的图片名。
+     *
+     * 只为了避免同一张被多条会话引用的图重复发 HEAD；每次同步开始时清空 ——
+     * 上一次可能传到一半失败，留着会让它永远被跳过。
+     */
+    private val uploadedMedia = mutableSetOf<String>()
 
     /** 手动「立即同步」。 */
     fun startSync() {
@@ -129,9 +139,10 @@ class SyncManager(
     private suspend fun sync() {
         if (!running.tryLock()) return
         val work = File(context.cacheDir, SyncWorkDir).apply { mkdirs() }
-        val remote = File(work, "remote.jsonl")
+        uploadedMedia.clear()
+        val conversationFile = File(work, "conversation.json")
         val incoming = File(work, "incoming.jsonl")
-        val payload = File(work, "payload.jsonl")
+        val metaFile = File(work, "meta.json")
 
         try {
             val stored = settings.current()
@@ -140,24 +151,102 @@ class SyncManager(
                 return
             }
             val config = stored.davConfig()
+            val root = config.path
 
+            // ── 1. 远端状态：meta（预设）+ conv/ 目录清单 ──
             _state.value = SyncState(running = true, stage = SyncStage.DOWNLOAD)
-            val hadRemote = client.downloadToFile(config, config.path, remote)
+            val meta = if (client.downloadToFile(config, SyncLayout.metaPath(root), metaFile)) {
+                readMeta(metaFile)
+            } else {
+                null
+            }
+            val remoteById = client.listNames(config, SyncLayout.conversationDir(root))
+                .mapNotNull(SyncLayout::parseConversationName)
+                .groupBy { it.id }
+                .mapValues { (_, versions) -> versions.maxByOrNull { it.updatedAt }!! }
 
-            _state.value = SyncState(running = true, stage = SyncStage.MERGE)
-            val merge = merge(config, remote, incoming, hadRemote)
+            // ── 2. 拉取：只下比本地新的会话 ──
+            val localStamps = repository.syncStamps().associate { it.id to it.updatedAt }
+            val toPull = remoteById.values.filter { shouldPull(it.updatedAt, localStamps[it.id]) }
+            var pulled = 0
+            val overwriting = mutableListOf<String>()
 
-            _state.value = SyncState(running = true, stage = SyncStage.UPLOAD)
-            // 先把本地状态写成载荷文件（逐会话），再上传 —— 内存里只过一条会话
-            val mediaNames = writeLocalPayload(payload)
-            // 图片先走：否则另一端可能读到"引用了还不存在的图片"的载荷
-            val mediaUploaded = uploadMedia(config, mediaNames)
-            client.uploadFile(config, config.path, payload, WebDavClient.SyncPayloadMedia)
+            if (toPull.isNotEmpty()) {
+                // 下一个、写一行到临时文件、再下一个：磁盘占位，内存只过一条
+                SyncPayloadWriter(incoming.bufferedWriter()).use { writer ->
+                    for ((index, entry) in toPull.withIndex()) {
+                        _state.value = SyncState(
+                            running = true,
+                            stage = SyncStage.MERGE,
+                            done = index,
+                            total = toPull.size,
+                        )
+                        val path = SyncLayout.conversationPath(root, entry.name)
+                        if (!client.downloadToFile(config, path, conversationFile)) continue
+                        val conversation = readConversation(conversationFile) ?: continue
+                        if (localStamps.containsKey(conversation.id)) overwriting += conversation.id
+                        writer.writeConversation(adoptMedia(config, conversation))
+                        pulled++
+                    }
+                }
+                if (pulled > 0) {
+                    keepDrafts(overwriting)
+                    repository.importSyncStream(
+                        conversations = SyncPayload.conversations(incoming),
+                        presetsToWrite = newerPresets(repository.syncPresets(), meta?.presets.orEmpty()),
+                    )
+                }
+            }
+
+            // ── 3. 上传：只传"远端还没有这一版"的会话 ──
+            val afterPull = repository.syncStamps()
+            var uploadedConversations = 0
+            var uploadedImages = 0
+
+            for ((index, stamp) in afterPull.withIndex()) {
+                _state.value = SyncState(
+                    running = true,
+                    stage = SyncStage.UPLOAD,
+                    done = index,
+                    total = afterPull.size,
+                )
+                val name = SyncLayout.conversationName(stamp.id, stamp.updatedAt)
+                val existing = remoteById[stamp.id]
+                if (existing?.name == name) continue // 远端已经是这一版
+
+                val conversation = repository.backupConversationForSync(stamp.id) ?: continue
+                val (externalized, mediaNames) = externalizeMedia(conversation)
+                // 图片先走：不然另一端可能先读到"引用了还不存在的图片"的会话
+                uploadedImages += uploadMedia(config, mediaNames.toList())
+
+                writeConversation(conversationFile, externalized)
+                client.uploadFile(
+                    config = config,
+                    remotePath = SyncLayout.conversationPath(root, name),
+                    file = conversationFile,
+                    mediaType = WebDavClient.SyncPayloadMedia,
+                )
+                uploadedConversations++
+
+                // 旧版本文件顺手删掉，免得远端越积越多
+                if (existing != null) {
+                    runCatching { client.delete(config, SyncLayout.conversationPath(root, existing.name)) }
+                }
+            }
+
+            // ── 4. 元信息最后写（预设 / 版本），失败不影响会话数据 ──
+            writeMeta(metaFile, SyncHeader(exportedAt = System.currentTimeMillis(), presets = repository.syncPresets()))
+            client.uploadFile(
+                config = config,
+                remotePath = SyncLayout.metaPath(root),
+                file = metaFile,
+                mediaType = WebDavClient.SyncPayloadMedia,
+            )
 
             settings.setDavLastSyncAt(System.currentTimeMillis())
             _state.value = SyncState(
-                message = buildResultMessage(merge, mediaUploaded),
-                pulled = merge.pulled,
+                message = Res.get(R.string.sync_done, pulled, uploadedConversations, uploadedImages),
+                pulled = pulled,
             )
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -165,80 +254,11 @@ class SyncManager(
             _state.value = SyncState(message = error.userMessage(), failed = true)
         } finally {
             running.unlock()
-            listOf(remote, incoming, payload).forEach { runCatching { it.delete() } }
+            listOf(conversationFile, incoming, metaFile).forEach { runCatching { it.delete() } }
         }
     }
 
-    private fun buildResultMessage(merge: MergeOutcome, mediaUploaded: Int): String = buildString {
-        append(Res.get(R.string.sync_done, merge.pulled, mediaUploaded))
-        if (merge.brokenLines > 0) append(Res.get(R.string.sync_note_broken, merge.brokenLines))
-        if (merge.legacyRemoteReplaced) append(Res.get(R.string.sync_note_legacy))
-    }
-
-    // ── 合并（逐行） ─────────────────────────────────────
-
-    private data class MergeOutcome(
-        val pulled: Int = 0,
-        val brokenLines: Int = 0,
-        /** 云端原来放的是旧格式/别的文件，这次被新格式整体替换了。 */
-        val legacyRemoteReplaced: Boolean = false,
-    )
-
-    /**
-     * 把远端合并进本地。
-     *
-     * 顺序很关键：先删掉本地那份过期的会话，再按 `MERGE` 导入 ——
-     * `MERGE` 遇到已存在的 id 会**整条跳过**（它服务的是"多设备汇总"，
-     * 语义是"本机的改动更权威"）。想让它真的写进去，就得先让 id 不存在。
-     *
-     * 顺带保住草稿：删会话会连带清掉草稿（那是设计上的对的做法，草稿不该
-     * 跟着已删会话留着），但这里删是为了**换版本**，不是用户主动删 ——
-     * 把草稿先存下来、导入完再放回去。
-     */
-    private suspend fun merge(
-        config: WebDavClient.Config,
-        remote: File,
-        incoming: File,
-        hadRemote: Boolean,
-    ): MergeOutcome {
-        val header = SyncPayload.readHeader(remote)
-            ?: return MergeOutcome(
-                brokenLines = 0,
-                legacyRemoteReplaced = hadRemote && remote.length() > 0L,
-            )
-
-        val localStamps = repository.syncStamps().associate { it.id to it.updatedAt }
-        val overwriting = mutableListOf<String>()
-        var pulled = 0
-        var broken = 0
-
-        // 逐行读远端 → 需要的写进 incoming，另存一份"要覆盖谁"的名单
-        SyncPayloadWriter(incoming.bufferedWriter()).use { writer ->
-            for ((_, conversation) in SyncPayload.conversationsWithFailures(remote)) {
-                if (conversation == null) {
-                    broken++
-                    continue
-                }
-                val mine = localStamps[conversation.id]
-                if (!shouldPull(conversation.updatedAt, mine)) continue
-                if (mine != null) overwriting += conversation.id
-                writer.writeConversation(adoptMedia(config, conversation))
-                pulled++
-            }
-        }
-
-        if (pulled == 0) return MergeOutcome(brokenLines = broken)
-
-        val drafts = overwriting.mapNotNull { id -> repository.findDraft(id)?.let { id to it } }
-        if (overwriting.isNotEmpty()) repository.deleteConversations(overwriting)
-        drafts.forEach { (id, text) -> repository.saveDraft(id, text) }
-
-        repository.importSyncStream(
-            conversations = SyncPayload.conversations(incoming),
-            presetsToWrite = newerPresets(repository.syncPresets(), header.presets),
-        )
-        return MergeOutcome(pulled = pulled, brokenLines = broken)
-    }
+    // ── 图片 ─────────────────────────────────────────────
 
     /**
      * 让远端会话里的图片**在本地可用**，并把附件改写成"本地文件名"。
@@ -273,56 +293,42 @@ class SyncManager(
         runCatching { client.downloadToFile(config, mediaRemotePath(name), target) }
     }
 
-    // ── 导出（逐会话写文件） ──────────────────────────────
-
-    /**
-     * 把本地状态写成载荷文件，返回**图片文件名**清单（供随后上传）。
-     *
-     * 一次只取一个会话：`syncStamps()` 给出 id + 时间戳，再逐个
-     * `backupConversationForSync(id)` —— 全程不会同时持有两条会话。
-     */
-    private suspend fun writeLocalPayload(target: File): List<String> {
-        val media = linkedSetOf<String>()
-        SyncPayloadWriter(target.bufferedWriter()).use { writer ->
-            writer.writeHeader(
-                SyncHeader(exportedAt = System.currentTimeMillis(), presets = repository.syncPresets()),
-            )
-            for (stamp in repository.syncStamps()) {
-                val conversation = repository.backupConversationForSync(stamp.id) ?: continue
-                writer.writeConversation(externalizeMedia(conversation, media))
-            }
-        }
-        return media.toList()
-    }
-
     /** 图片 → 内容寻址的文件名；文本附件保持内联（它们本来就小）。 */
     private fun externalizeMedia(
         conversation: BackupConversation,
-        collected: MutableSet<String>,
-    ): BackupConversation = conversation.copy(
-        messages = conversation.messages.map { message ->
-            if (message.attachments.none { it.isImage }) return@map message
-            message.copy(
-                attachments = message.attachments.map { attachment ->
-                    if (!attachment.isImage) return@map attachment
-                    val name = AttachmentFiles.contentAddressed(context, attachment)
-                    if (name == null) {
-                        // 原件缺失（用户清过数据 / 老数据坏了）：不把坏引用传上去
-                        attachment.copy(data = "", path = null)
-                    } else {
-                        collected += name
-                        attachment.copy(data = "", path = name)
-                    }
-                },
-            )
-        },
-    )
+    ): Pair<BackupConversation, Set<String>> {
+        val names = linkedSetOf<String>()
+        val rewritten = conversation.copy(
+            messages = conversation.messages.map { message ->
+                if (message.attachments.none { it.isImage }) return@map message
+                message.copy(
+                    attachments = message.attachments.map { attachment ->
+                        if (!attachment.isImage) return@map attachment
+                        val name = AttachmentFiles.contentAddressed(context, attachment)
+                        if (name == null) {
+                            // 原件缺失（用户清过数据 / 老数据坏了）：不把坏引用传上去
+                            attachment.copy(data = "", path = null)
+                        } else {
+                            names += name
+                            attachment.copy(data = "", path = name)
+                        }
+                    },
+                )
+            },
+        )
+        return rewritten to names
+    }
 
-    /** 上传远端还没有的图片。返回本次实际传上去的张数。 */
+    /**
+     * 上传这一批会话引用到的图片，返回**实际传上去**的张数。
+     *
+     * 远端已有同名文件（内容哈希相同）就跳过 —— 同一张图被十条会话引用时
+     * 只会传一次，后续连 HEAD 都不用发（[uploadedMedia] 记着）。
+     */
     private suspend fun uploadMedia(config: WebDavClient.Config, names: List<String>): Int {
-        if (names.isEmpty()) return 0
         var uploaded = 0
         for (name in names) {
+            if (!uploadedMedia.add(name)) continue
             val file = AttachmentFiles.fileOf(context, name) ?: continue
             if (!file.isFile || file.length() == 0L) continue
             if (runCatching { client.exists(config, mediaRemotePath(name)) }.getOrDefault(false)) continue
@@ -330,6 +336,14 @@ class SyncManager(
             uploaded++
         }
         return uploaded
+    }
+
+    /** 被替换的会话：先存草稿 → 删会话 → 导入完再写回。 */
+    private suspend fun keepDrafts(ids: List<String>) {
+        if (ids.isEmpty()) return
+        val drafts = ids.mapNotNull { id -> repository.findDraft(id)?.let { id to it } }
+        repository.deleteConversations(ids)
+        drafts.forEach { (id, text) -> repository.saveDraft(id, text) }
     }
 
     private companion object {

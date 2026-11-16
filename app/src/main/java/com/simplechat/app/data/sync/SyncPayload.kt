@@ -40,7 +40,7 @@ internal const val SyncFormat = "mydeepseek-sync"
 /** 载荷版本。1 = JSONL + 外置图片。 */
 internal const val SyncVersion = 1
 
-/** 图片在网盘上的目录名（相对同步文件所在目录的同级）。 */
+/** 图片在网盘上的目录名（与 `conv/`、`meta.json` 同级）。 */
 internal const val SyncMediaDir = "media"
 
 /** 首行：格式、版本、导出时间，以及**预设**（很小，一行装得下）。 */
@@ -159,4 +159,93 @@ internal fun newerPresets(
         val mine = localById[candidate.id]
         mine == null || candidate.updatedAt > mine.updatedAt
     }
+}
+
+
+/**
+ * 网盘上的目录布局。
+ *
+ * ```
+ * <远程目录>/
+ * ├─ meta.json                     格式/版本/导出时间/预设（很小，每次都传）
+ * ├─ conv/<id>.<updatedAt>.json    一个会话一个文件，**文件名自带版本**
+ * └─ media/<sha256>.jpg            图片，内容寻址
+ * ```
+ *
+ * ### 为什么不是一个会话也不合并，而是"一会话一文件"
+ *
+ * 之前的载荷是**一个** `sync.jsonl`：历史一大，单次 PUT 就是几十上百兆。
+ * 实测传到一半被服务端 503 掐断，重试还是从零开始 —— 既慢又永远传不完。
+ *
+ * 拆成"一会话一文件"之后：
+ *
+ * - 单次 PUT 只有几十 KB，不会再撞到体积/时长上限；
+ * - **文件名里带 `updatedAt`**，没改过的会话在远端已经有同名文件 → 直接跳过，
+ *   所以第二次同步只传新写的几条（增量）；
+ * - 传一半断了也没关系：已经传上去的那些下次会被自动跳过（断点续传）；
+ * - 不需要清单文件 —— `PROPFIND` 列一下 `conv/` 就知道远端有什么、是哪一版。
+ */
+internal object SyncLayout {
+
+    /** 元信息（预设等）。 */
+    const val MetaFile = "meta.json"
+
+    /** 会话目录。 */
+    const val ConversationDir = "conv"
+
+    fun metaPath(root: String): String = "$root/$MetaFile"
+
+    fun conversationDir(root: String): String = "$root/$ConversationDir"
+
+    fun conversationPath(root: String, name: String): String = "$root/$ConversationDir/$name"
+
+    /** `"<id>.<updatedAt>.json"`：id 是 UUID（不含点），所以从右往左拆是安全的。 */
+    fun conversationName(id: String, updatedAt: Long): String = "$id.$updatedAt.json"
+
+    /**
+     * 反解文件名。认不出返回 null（比如服务端塞进来的 `.DS_Store`、缩略图）。
+     *
+     * 刻意**不信任**解析结果里的 id 格式：只要求非空、时间戳能解析成数字，
+     * 这样换 id 方案（UUID → 其它）时不用同步改这里。
+     */
+    fun parseConversationName(name: String): RemoteConversation? {
+        // 只接受**纯文件名**：这个名字随后要拼进远端路径，带斜杠就能穿越目录。
+        // 正常列出目录时服务端只给最后一段，这里是防御性检查。
+        if (name.contains('/') || name.contains('\\')) return null
+        if (name == "." || name == "..") return null
+        if (!name.endsWith(ConversationSuffix)) return null
+        val stem = name.removeSuffix(ConversationSuffix)
+        val split = stem.lastIndexOf('.')
+        if (split <= 0) return null
+        val id = stem.substring(0, split)
+        val updatedAt = stem.substring(split + 1).toLongOrNull() ?: return null
+        return RemoteConversation(id = id, updatedAt = updatedAt, name = name)
+    }
+
+    private const val ConversationSuffix = ".json"
+}
+
+/** 远端的一个会话文件：`id` 是哪条、`updatedAt` 是哪一版。 */
+internal data class RemoteConversation(
+    val id: String,
+    val updatedAt: Long,
+    val name: String,
+)
+
+/** 单会话文件的读写（一次只碰一个会话，内存里有界）。 */
+internal fun readConversation(file: File): BackupConversation? = runCatching {
+    syncJson.decodeFromString(BackupConversation.serializer(), file.readText())
+}.getOrNull()
+
+internal fun writeConversation(file: File, conversation: BackupConversation) {
+    file.writeText(syncJson.encodeToString(BackupConversation.serializer(), conversation))
+}
+
+/** 元信息读写。 */
+internal fun readMeta(file: File): SyncHeader? = runCatching {
+    syncJson.decodeFromString(SyncHeader.serializer(), file.readText())
+}.getOrNull()?.takeIf { it.format == SyncFormat }
+
+internal fun writeMeta(file: File, meta: SyncHeader) {
+    file.writeText(syncJson.encodeToString(SyncHeader.serializer(), meta))
 }
