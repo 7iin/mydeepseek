@@ -57,7 +57,8 @@ myDeepSeek 是从 [SimpleChat](https://github.com/Pokanshuu/Simple-Chat) fork �
 
 ### 环境要求
 
-- JDK 17（Android Studio 自带的 JBR 21 也可以）
+- **JDK 21**（Android Studio 自带的 JBR 21 正好；17 能编译，但跑不了单元测试 ——
+  `highlights` 依赖是 Java 21 字节码）
 - Android SDK platform 37、build-tools 37.0.0
 - Gradle 由 wrapper 自动下载
 

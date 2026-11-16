@@ -35,7 +35,8 @@ targeted changes and a few real bug fixes (see [CODE_REVIEW.md](CODE_REVIEW.md))
 
 ## Build
 
-Requirements: JDK 17, Android SDK platform 37 / build-tools 37.0.0.
+Requirements: **JDK 21** (Android Studio's bundled JBR 21 works), Android SDK platform 37 / build-tools 37.0.0.
+JDK 17 can compile but cannot run the unit tests — the `highlights` dependency ships Java 21 bytecode.
 
 ```bash
 ./gradlew assembleDebug      # app/build/outputs/apk/debug/
