@@ -44,6 +44,10 @@ class WebDavClient(
     private val client: OkHttpClient = defaultClient(),
 ) {
 
+    /** 上一次请求的时间戳（毫秒）；0 = 还没发过。 */
+    private var lastRequestAt = 0L
+    private val paceLock = Any()
+
     /** 一次同步所需的全部连接信息。 */
     data class Config(
         /** 已经去掉结尾斜杠的服务器地址。 */
@@ -222,11 +226,75 @@ class WebDavClient(
         }
     }
 
-    private fun call(request: Request): Response = try {
-        client.newCall(request).execute()
-    } catch (e: IOException) {
-        // DNS / 超时 / TLS：都归一句"网络错误"，后面带上系统原文
-        throw AppTextException(R.string.sync_err_network, e.message.orEmpty())
+    /**
+     * 发一个请求，**自带节流与风控退避**。
+     *
+     * 坚果云这类服务端限的是"单位时间请求数"，同步又天生是密集请求
+     * （几百个会话 + 几百张图）。不节流的话第一次全量同步必然撞上 503 ——
+     * 请求本身完全合法，只是密。
+     *
+     * 两条措施，缺一不可：
+     *
+     * 1. **每个请求之间至少隔 [MinIntervalMs]** —— 把突发摊平成稳定节奏。
+     *    以 120ms 计，一分钟约 500 个请求，远低于常见阈值。
+     * 2. **429 / 503 / 509 指数退避后重试**，并尊重 `Retry-After`。
+     *    以前这类响应会被翻译成"服务器返回 HTTP 503"直接判死整次同步，
+     *    于是一半数据传上去、另一半永远传不上去 —— 越重试越像攻击。
+     *
+     * 所有请求方法（PUT/GET/HEAD/PROPFIND/DELETE/MKCOL）都是幂等的，
+     * 所以重试是安全的。
+     */
+    private fun call(request: Request): Response {
+        var attempt = 0
+        while (true) {
+            pace()
+            val response = try {
+                client.newCall(request).execute()
+            } catch (e: IOException) {
+                if (attempt < MaxRetries) {
+                    backoff(attempt)
+                    attempt++
+                    continue
+                }
+                // DNS / 超时 / TLS：都归一句"网络错误"，后面带上系统原文
+                throw AppTextException(R.string.sync_err_network, e.message.orEmpty())
+            }
+
+            if (response.code in ThrottledCodes && attempt < MaxRetries) {
+                // 服务端给的等待秒数优先（有的直接写 Retry-After: 60）
+                val retryAfter = response.header("Retry-After")?.trim()?.toLongOrNull()
+                response.close()
+                backoff(attempt, explicitMs = retryAfter?.times(1000))
+                attempt++
+                continue
+            }
+            return response
+        }
+    }
+
+    /** 把请求摊平：两次请求之间至少隔 [MinIntervalMs]。 */
+    private fun pace() {
+        synchronized(paceLock) {
+            val now = System.currentTimeMillis()
+            val wait = MinIntervalMs - (now - lastRequestAt)
+            if (lastRequestAt > 0 && wait > 0) sleepQuietly(wait)
+            lastRequestAt = System.currentTimeMillis()
+        }
+    }
+
+    /** 指数退避：1.2s → 2.4s → 4.8s … 封顶 [MaxBackoffMs]。 */
+    private fun backoff(attempt: Int, explicitMs: Long? = null) {
+        val wait = explicitMs ?: (BaseBackoffMs shl attempt.coerceIn(0, 5))
+        sleepQuietly(wait.coerceIn(MinBackoffMs, MaxBackoffMs))
+    }
+
+    private fun sleepQuietly(ms: Long) {
+        try {
+            Thread.sleep(ms)
+        } catch (interrupted: InterruptedException) {
+            // 被要求中断就当这一轮结束：调用方（协程取消）会看到后续的 IOException
+            Thread.currentThread().interrupt()
+        }
     }
 
     private fun authorized(config: Config, url: HttpUrl): Request.Builder =
@@ -273,6 +341,25 @@ class WebDavClient(
         private val XmlMedia = "application/xml; charset=utf-8".toMediaType()
 
         private const val Buffer = 64 * 1024
+
+        /**
+         * 两次请求的最小间隔。
+         *
+         * 120ms ≈ 每分钟 500 个请求。首次全量同步会因此多花一两分钟，
+         * 但换来的是"不再被风控掐断" —— 慢而成功，比快而始终传不完强。
+         */
+        private const val MinIntervalMs = 120L
+
+        /** 指数退避的起点与上下限。 */
+        private const val BaseBackoffMs = 1_200L
+        private const val MinBackoffMs = 1_000L
+        private const val MaxBackoffMs = 60_000L
+
+        /** 重试次数。配合退避，最坏情况会等约两分钟才放弃。 */
+        private const val MaxRetries = 5
+
+        /** 服务端明确表示"请求太密/太忙"的那几个码。 */
+        private val ThrottledCodes = setOf(429, 503, 509)
 
         private const val UserAgent = "myDeepSeek-Android"
 

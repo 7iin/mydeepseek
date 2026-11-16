@@ -197,6 +197,11 @@ internal object SyncLayout {
 
     fun conversationDir(root: String): String = "$root/$ConversationDir"
 
+    /** 图片目录：上传前用它列一次远端已有清单（省掉每张图一次 HEAD）。 */
+    fun mediaDir(root: String): String = "$root/$SyncMediaDir"
+
+    fun mediaPath(root: String, name: String): String = "$root/$SyncMediaDir/$name"
+
     fun conversationPath(root: String, name: String): String = "$root/$ConversationDir/$name"
 
     /** `"<id>.<updatedAt>.json"`：id 是 UUID（不含点），所以从右往左拆是安全的。 */

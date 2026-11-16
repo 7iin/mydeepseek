@@ -4,7 +4,7 @@
 
 **中文 | [English](README.en.md)**
 
-![Version](https://img.shields.io/badge/version-1.2.2-blue)
+![Version](https://img.shields.io/badge/version-1.2.3-blue)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ## 这是什么
@@ -237,6 +237,35 @@ myDeepSeek/
 
 **断了能续**：已经传上去的会话下次会被自动跳过；没有任何一步需要"从头再来"。
 内存峰值只跟**最大的那一个会话**有关，与库有多大无关。
+
+### 首次同步被网盘限流了怎么办（可选）
+
+坚果云这类服务端限的是**单位时间请求数**。首次同步要把整个库传一遍 —— 几百个会话、
+每张图一个请求 —— 很容易被判定为异常流量，返回 `503` 或者干脆断连。
+应用里已经做了两道防护（请求间隔 120ms + 429/503/509 指数退避重试），但
+**历史特别大的话，最省事的办法是让电脑帮你传**。
+
+网盘上那套东西是纯静态文件，用网盘客户端拖上去**不经过 API，也就不会被限流**：
+
+1. 在手机上「设置 → 数据 → 导出所有数据」，把备份文件拷到电脑
+2. 转换格式（只依赖 Python 标准库）：
+
+```bash
+python tools/seed_webdav.py 备份.zip -o myDeepSeek
+```
+
+```
+myDeepSeek/
+├─ meta.json
+├─ conv/<id>.<updatedAt>.json
+└─ media/<sha256前32位>.jpg
+```
+
+3. 把这个 `myDeepSeek` 整个目录上传到网盘的「远程目录」位置（覆盖旧的）
+4. 回 app 点「立即同步」—— 远端已经是最新版本，只会发几个请求就结束
+
+> 转换脚本和应用共享同一套命名规则（文件夹名 = `id.updatedAt`，图片名 = 内容哈希），
+> 所以两边对"这是不是同一版"的判断完全一致。`SyncPayloadTest` 里有一条测试专门钉住这个契约。
 
 ### 限制（务必知道）
 

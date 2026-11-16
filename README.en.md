@@ -4,7 +4,7 @@
 
 **[中文](README.md) | English**
 
-![Version](https://img.shields.io/badge/version-1.2.2-blue)
+![Version](https://img.shields.io/badge/version-1.2.3-blue)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ## What this is
@@ -119,6 +119,30 @@ How it works: `GET meta.json` + `PROPFIND conv/` → download only chats newer t
 superseded local copy, keep drafts, import) → upload only chats the remote doesn't have this version
 of, images first → write `meta.json` last and drop the superseded remote files. Peak memory tracks the
 **largest single chat**, not the library size.
+
+### First sync got rate-limited? Seed the folder from your PC
+
+Nutstore and friends throttle by **requests per unit time**. A first sync pushes the whole
+library — hundreds of chats, one request per image — which looks like abuse and gets a `503`.
+The app already paces itself (120 ms between requests) and backs off on 429/503/509, but with a
+very large history the easy way out is to let your PC do the upload.
+
+The remote folder is plain static files, so dragging it up with the drive's desktop client
+**bypasses the API and its throttling**:
+
+1. On the phone: Settings → Data → Export all data, copy the backup to your PC
+2. Convert it (stdlib only):
+
+```bash
+python tools/seed_webdav.py backup.zip -o myDeepSeek
+```
+
+3. Upload that whole folder to the remote path configured in the app
+4. Tap "Sync now" — the remote is already current, so it costs a handful of requests
+
+> The script and the app share the same naming rules (folder name = `id.updatedAt`, image name =
+> content hash), so "is the remote already this version" always agrees. A test in
+> `SyncPayloadTest` pins that contract.
 
 Known limits:
 

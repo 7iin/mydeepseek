@@ -199,6 +199,11 @@ class SyncManager(
             }
 
             // ── 3. 上传：只传"远端还没有这一版"的会话 ──
+            //
+            // 远端 `media/` 有哪些图只查**一次**（PROPFIND 列目录）。
+            // 之前是每张图发一次 HEAD —— 500 张图 = 500 个多余请求，
+            // 正好撞在网盘的"请求频率"风控上。
+            var remoteMedia: Set<String>? = null
             val afterPull = repository.syncStamps()
             var uploadedConversations = 0
             var uploadedImages = 0
@@ -216,8 +221,13 @@ class SyncManager(
 
                 val conversation = repository.backupConversationForSync(stamp.id) ?: continue
                 val (externalized, mediaNames) = externalizeMedia(conversation)
+                if (mediaNames.isNotEmpty() && remoteMedia == null) {
+                    remoteMedia = runCatching {
+                        client.listNames(config, SyncLayout.mediaDir(root)).toSet()
+                    }.getOrDefault(emptySet())
+                }
                 // 图片先走：不然另一端可能先读到"引用了还不存在的图片"的会话
-                uploadedImages += uploadMedia(config, mediaNames.toList())
+                uploadedImages += uploadMedia(config, mediaNames.toList(), remoteMedia.orEmpty())
 
                 writeConversation(conversationFile, externalized)
                 client.uploadFile(
@@ -322,16 +332,24 @@ class SyncManager(
     /**
      * 上传这一批会话引用到的图片，返回**实际传上去**的张数。
      *
-     * 远端已有同名文件（内容哈希相同）就跳过 —— 同一张图被十条会话引用时
-     * 只会传一次，后续连 HEAD 都不用发（[uploadedMedia] 记着）。
+     * 判重完全在内存里做（[remoteMedia] 是本次同步开头列目录拿到的远端名单，
+     * [uploadedMedia] 记着本次已经处理过的），**一个 HEAD 都不发**。
+     *
+     * 内容寻址让这张表永远有效：名字 = 内容哈希，所以"远端有这个名字"就等于
+     * "这张图已经在远端了"。同一张图被十条会话引用也只传一次。
      */
-    private suspend fun uploadMedia(config: WebDavClient.Config, names: List<String>): Int {
+    private suspend fun uploadMedia(
+        config: WebDavClient.Config,
+        names: List<String>,
+        remoteMedia: Set<String>,
+    ): Int {
         var uploaded = 0
         for (name in names) {
+            if (name in remoteMedia) continue
+            // 已传过、或本次已在队列里的跳过（linkedSet 顺便当去重表）
             if (!uploadedMedia.add(name)) continue
             val file = AttachmentFiles.fileOf(context, name) ?: continue
             if (!file.isFile || file.length() == 0L) continue
-            if (runCatching { client.exists(config, mediaRemotePath(name)) }.getOrDefault(false)) continue
             client.uploadFile(config, mediaRemotePath(name), file)
             uploaded++
         }

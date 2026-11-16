@@ -186,6 +186,50 @@ class SyncPayloadTest {
         )
     }
 
+    // ── 与「手动预置脚本」的契约 ────────────────────────
+
+    /**
+     * `tools/seed_webdav.py` 产出的紧凑 JSON 必须能被读懂。
+     *
+     * 那条路是给"首次全量上传被网盘风控"准备的：用户在电脑上把目录拖上去，
+     * app 只做增量。**只要一边改了格式另一边没跟上，这条路就静默失效** ——
+     * app 会把远端会话读成 null，然后重新传一遍全库，等于白做。
+     *
+     * 这里钉住三件事：能解析、图片认成"已落盘"、`data` 是空串
+     * （空串很重要：不为空就说明 base64 又回到 JSON 里了）。
+     */
+    @Test
+    fun `脚本产出的单会话文件能被原样读回`() {
+        // 与 tools/seed_webdav.py 的输出逐字节同构：紧凑、无缩进、data 为空串。
+        // 括号外允许换行（JSON 的空白），所以这里直接写成多行，别再拼接。
+        val json = """
+            {"id":"8f14e45f-ea6b-4b1e-9f0c-1d2a3b4c5d6e","title":"带图",
+             "mode":"CREATIVE","createdAt":1,"updatedAt":1700000000123,
+             "messages":[{"id":"m1","parentId":"","role":"user","content":"看图","createdAt":1,
+                          "attachments":[{"kind":"IMAGE","name":"a.png","mime":"image/png",
+                                          "data":"","width":1,"height":1,
+                                          "path":"c414cd0e204de974f73753c7e28d7638.png"}]}]}
+        """.trimIndent()
+        val file = tempFile().also { it.writeText(json) }
+
+        /*
+         * 这里刻意**不用** `readConversation`：它内部 `runCatching` 会把解析异常吞成 null，
+         * 断言只会说"不是 null"，看不出缺了哪个字段。直接解析能让失败信息带上字段名。
+         */
+        val conversation = try {
+            syncJson.decodeFromString(BackupConversation.serializer(), file.readText())
+        } catch (error: Exception) {
+            throw AssertionError("脚本产物解析失败：" + error.message, error)
+        }
+        assertEquals(1700000000123L, conversation.updatedAt)
+        assertEquals("8f14e45f-ea6b-4b1e-9f0c-1d2a3b4c5d6e", conversation.id)
+
+        val attachment = conversation.messages.single().attachments.single()
+        assertTrue("图片应被认成已落盘", attachment.isStored)
+        assertEquals("c414cd0e204de974f73753c7e28d7638.png", attachment.path)
+        assertEquals("base64 不能回到 JSON 里", "", attachment.data)
+    }
+
     // ── 冲突判定 ────────────────────────────────────────
 
     @Test
