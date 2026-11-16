@@ -82,8 +82,18 @@ class SpeechOutputController(private val context: Context) {
                 return@TextToSpeech
             }
             initFailed = false
-            engine?.voice = null // 先回到系统默认，再按偏好挑
-            engine?.language = preferredLocale()
+            /*
+             * ⚠️ **绝不能写 `engine?.voice = null`。**
+             *
+             * `TextToSpeech.setVoice(null)` 在 AOSP 的多数实现里只是被忽略，
+             * 但部分 ROM（实测华为 HarmonyOS）会在内部直接 `voice.getName()` ——
+             * 于是"恢复默认音色"这一句就是一次启动闪退：
+             * `NullPointerException: Attempt to invoke virtual method
+             * 'String android.speech.tts.Voice.getName()' on a null object reference`。
+             *
+             * 回到默认音色的正确做法是**只设语言**，让引擎自己挑该语言的默认音色。
+             */
+            runCatching { engine?.language = preferredLocale() }
             applyVoice(preferredVoice)
             engine?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) = Unit
@@ -122,11 +132,17 @@ class SpeechOutputController(private val context: Context) {
             .takeIf { it.isNotBlank() }
             ?.let { wanted -> tts.voices?.firstOrNull { it.name == wanted } }
         if (voice != null) {
-            tts.voice = voice
-        } else {
-            tts.voice = null
-            tts.language = preferredLocale()
+            // 用户选的音色可能已被引擎删掉（换引擎 / 升级）：设不进去就当没选
+            runCatching { tts.voice = voice }
+            return
         }
+        /*
+         * 没有可用的偏好音色 → 回到默认。
+         *
+         * **不调 `setVoice(null)`**（见 initialize 里的说明：会闪退）。
+         * 只设语言，让引擎按该语言给默认音色 —— 这也正是"系统默认"的语义。
+         */
+        runCatching { tts.language = preferredLocale() }
     }
 
     /** 念 / 停止念同一条消息。 */

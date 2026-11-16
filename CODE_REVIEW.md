@@ -25,6 +25,7 @@
 | 6 | 低 | 用户气泡的手势挂在气泡本身，图片移到气泡外后纯图片消息失去编辑 / 删除入口 | 已修（随重构） |
 | 7 | 中 | 「覆盖同名」导入不回收被替换会话的图片文件 | 未修，已记录 |
 | 8 | — | 数据库里 `conversations.provider/model` 是只写不读的死列 | 保留（删列有级联风险） |
+| 9 | 高 | 朗读初始化调用 `TextToSpeech.setVoice(null)`，部分 ROM（华为）直接 NPE，**一开就闪退** | 已修 |
 
 ---
 
@@ -124,6 +125,33 @@ val target = with(density) { 1080.dp.roundToPx() }   // 3 倍屏 = 3240px
 `PRAGMA foreign_keys` 又不能改（迁移跑在事务里）。**认同这个判断，保留。**
 
 ---
+
+## 9（高）朗读初始化闪退（真机抓到的）
+
+**位置**：`ui/chat/SpeechOutput.kt` · `initialize()` / `applyVoice()`。
+
+**现象**（华为 HarmonyOS 真机 logcat，进应用即崩）：
+
+```
+java.lang.NullPointerException: Attempt to invoke virtual method
+'java.lang.String android.speech.tts.Voice.getName()' on a null object reference
+    at android.speech.tts.TextToSpeech.lambda$setVoice$13$TextToSpeech(TextToSpeech.java:1696)
+    at tt2.onInit(...)          ← 我们的 onInit 回调
+```
+
+**根因**：初始化回调里写了 `engine?.voice = null`，本意是"先回到系统默认音色再按偏好挑"。
+`TextToSpeech.setVoice(null)` 在 AOSP 的多数实现里确实只是被忽略，但有些 ROM
+在 `runAction` 内部**无条件** `voice.getName()` —— 于是这一句就是一次启动崩溃。
+`applyVoice()` 的 else 分支里有同样一句。
+
+**为什么本地/模拟器发现不了**：Pixel / 模拟器上 `setVoice(null)` 不抛；只有这类 ROM 才会。
+而它在 **onInit 回调**里，回调跑在主线程 Handler 上 → 异常直接终结进程，连错误提示都来不及给。
+
+**修复**：
+- 删掉两处 `setVoice(null)`。回到默认音色的正确做法是**只设语言**
+  （`tts.language = preferredLocale()`），由引擎挑该语言的默认音色。
+- 两处 `language` / `voice` 赋值都包了 `runCatching`：换引擎、音色被删、ROM 差异
+  都不该让进程挂掉 —— 朗读是可选功能，最坏结果应该是"点了没声"。
 
 ## 其它记录（不改，但值得知道）
 
