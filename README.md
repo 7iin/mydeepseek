@@ -339,3 +339,4 @@ app/src/main/java/com/simplechat/app/
 
 上游项目：[Pokanshuu/Simple-Chat](https://github.com/Pokanshuu/Simple-Chat)。
 本仓库是它的个人定制分支，不是上游官方版本；问题请提到本仓库。
+
